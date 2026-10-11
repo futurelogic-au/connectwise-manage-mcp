@@ -36,7 +36,11 @@ import {
  *    average cost that ConnectWise itself holds against the inventory.
  */
 
-/** Bins are scanned concurrently, kept low so a wide scan does not trip API rate limits. */
+/**
+ * Bins are scanned concurrently, kept low so a wide scan does not trip API rate limits.
+ * Concurrent requests are safe when TLS verification is relaxed: CwManageClient scopes
+ * rejectUnauthorized to its own undici Agent and never writes NODE_TLS_REJECT_UNAUTHORIZED.
+ */
 const BIN_SCAN_CONCURRENCY = 4;
 
 /** Catalog item lookups are chunked so the conditions string stays a sane length. */
@@ -71,6 +75,13 @@ interface CatalogItemRecord {
   serializedFlag?: boolean | null;
 }
 
+/**
+ * Register the procurement inventory tools (warehouses, bins, on-hand scan,
+ * and inventory adjustments) on the MCP server.
+ *
+ * @param server MCP server to register tools on.
+ * @param client ConnectWise Manage client used by the tools.
+ */
 export function registerProcurementTools(server: McpServer, client: CwManageClient) {
   // -------------------------------------------------------------------------
   // Warehouse structure
@@ -349,7 +360,7 @@ export function registerProcurementTools(server: McpServer, client: CwManageClie
 
   server.tool(
     "cw_create_adjustment",
-    "Create an inventory adjustment header in ConnectWise Manage and return its ID. This writes the header only and moves no stock: add lines with cw_add_adjustment_detail, then post it with cw_close_adjustment. An open adjustment has no effect on on-hand quantities, so it is safe to leave one open and delete it in ConnectWise if the plan changes. ConnectWise has no 'summary' field on an adjustment: the free-text fields are reason (max 100 characters, which is what shows in the adjustment list) and notes (unbounded).",
+    "Create an inventory adjustment header in ConnectWise Manage and return its ID. This writes the header only and moves no stock: add lines with cw_add_adjustment_detail, then post it with cw_close_adjustment. The open header stays open until someone deletes it in the ConnectWise UI. This server has no delete tool. Do not call cw_close_adjustment unless the user intends to post stock. ConnectWise has no 'summary' field on an adjustment: the free-text fields are reason (max 100 characters, which is what shows in the adjustment list) and notes (unbounded).",
     {
       identifier: z
         .string()
@@ -515,6 +526,25 @@ export function registerProcurementTools(server: McpServer, client: CwManageClie
       id: z.number().describe("Adjustment ID to close and post"),
     },
     async ({ id }) => {
+      const adjustment = await client.get<{ closedFlag?: boolean | null }>(
+        `/procurement/adjustments/${id}`,
+      );
+      if (adjustment?.closedFlag === true) {
+        throw new Error(
+          `Adjustment ${id} is already closed and has posted. Do not patch closedFlag again. Reverse a posted adjustment with a counter-adjustment.`,
+        );
+      }
+
+      const details = await fetchAllPages<Record<string, unknown>>(
+        client,
+        `/procurement/adjustments/${id}/details`,
+      );
+      if (details.length === 0) {
+        throw new Error(
+          `Adjustment ${id} has no detail lines. Add lines with cw_add_adjustment_detail before closing, and do not close unless the user intends to post stock.`,
+        );
+      }
+
       const result = await client.patch(`/procurement/adjustments/${id}`, [
         { op: "replace", path: "closedFlag", value: true },
       ]);

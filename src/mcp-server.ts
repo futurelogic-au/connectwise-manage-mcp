@@ -33,6 +33,7 @@ import { registerProcurementTools } from "./tools/procurement.js";
 import { registerHealthTools } from "./tools/health.js";
 import { registerAgreementTools } from "./tools/agreements.js";
 import { registerOpportunityTools } from "./tools/opportunities.js";
+import { registerFinanceProcurementTools } from "./tools/finance-procurement.js";
 
 export type { CwManageConfig };
 
@@ -97,10 +98,19 @@ export function resolveGatewayConfig(
  *   When provided, the client is built from it instead of reading process.env.
  */
 export function createMcpServer(configOverride?: CwManageConfig): McpServer {
-  const server = new McpServer({
-    name: "connectwise-manage-mcp",
-    version: "1.4.0",
-  });
+  const server = new McpServer(
+    {
+      name: "connectwise-manage-mcp",
+      version: "1.4.0",
+    },
+    {
+      capabilities: {
+        extensions: {
+          "io.modelcontextprotocol/ui": {},
+        },
+      },
+    }
+  );
 
   // MCP Apps (SEP-1865): the ui:// ticket card is static embedded HTML, so it
   // is served with or without credentials (hosts may prefetch it).
@@ -160,6 +170,7 @@ export function createMcpServer(configOverride?: CwManageConfig): McpServer {
   registerHealthTools(server, client);
   registerAgreementTools(server, client);
   registerOpportunityTools(server, client);
+  registerFinanceProcurementTools(server, client);
 
   return server;
 }
