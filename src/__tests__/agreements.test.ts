@@ -127,12 +127,15 @@ describe("agreement tool registration", () => {
       "cw_create_agreement_addition",
       "cw_get_agreement",
       "cw_get_agreement_additions",
+      "cw_get_agreement_recap",
       "cw_get_invoice",
       "cw_search_agreement_additions",
+      "cw_search_agreement_recaps",
       "cw_search_agreements",
       "cw_search_invoices",
       "cw_update_agreement_addition",
       "cw_update_agreement_addition_product",
+      "cw_update_invoice",
     ]);
   });
 

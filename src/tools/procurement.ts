@@ -1,13 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CwManageClient } from "../api-client.js";
-import {
-  fetchAllPages,
-  mapWithConcurrency,
-  andConditions,
-  round2,
-  type Reference,
-} from "./paging.js";
 
 /**
  * Procurement inventory tools (ConnectWise Procurement API).
@@ -36,11 +29,24 @@ import {
  *    average cost that ConnectWise itself holds against the inventory.
  */
 
-/** Bins are scanned concurrently, kept low so a wide scan does not trip API rate limits. */
+/** ConnectWise caps pageSize at 1000 on every paged endpoint. */
+const MAX_PAGE_SIZE = 1000;
+
+/**
+ * Bins are scanned concurrently, kept low so a wide scan does not trip API rate limits.
+ * Concurrent requests are safe when TLS verification is relaxed: CwManageClient scopes
+ * rejectUnauthorized to its own undici Agent and never writes NODE_TLS_REJECT_UNAUTHORIZED.
+ */
 const BIN_SCAN_CONCURRENCY = 4;
 
 /** Catalog item lookups are chunked so the conditions string stays a sane length. */
 const CATALOG_LOOKUP_CHUNK = 100;
+
+interface Reference {
+  id?: number | null;
+  identifier?: string;
+  name?: string;
+}
 
 interface WarehouseBinRecord {
   id?: number;
@@ -71,6 +77,81 @@ interface CatalogItemRecord {
   serializedFlag?: boolean | null;
 }
 
+/**
+ * Read every page of a ConnectWise collection endpoint.
+ *
+ * ConnectWise returns a bare array and no total count, so the only reliable
+ * stop condition is a short page. maxPages guards against an endpoint that
+ * ignores paging and hands back the same page forever. Hitting it throws
+ * rather than returning a truncated list, because callers total the rows and
+ * a silent partial result would give wrong totals.
+ */
+async function fetchAllPages<T>(
+  client: CwManageClient,
+  path: string,
+  params: Record<string, string | number | undefined> = {},
+  maxPages = 100,
+): Promise<T[]> {
+  const pageSize = MAX_PAGE_SIZE;
+  const all: T[] = [];
+
+  for (let page = 1; page <= maxPages; page++) {
+    const batch = await client.get<T[]>(path, { ...params, page, pageSize });
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    all.push(...batch);
+    if (batch.length < pageSize) break;
+    if (page === maxPages) {
+      throw new Error(
+        `Pagination limit of ${maxPages} pages reached before ${path} ended. Narrow the request rather than accept a partial result.`,
+      );
+    }
+  }
+
+  return all;
+}
+
+/** Run an async mapper over items, at most `limit` in flight at once. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      for (let index = cursor++; index < items.length; index = cursor++) {
+        results[index] = await mapper(items[index]);
+      }
+    },
+  );
+
+  await Promise.all(workers);
+  return results;
+}
+
+/** Combine a caller-supplied conditions string with a filter this tool adds itself. */
+function andConditions(...parts: Array<string | undefined>): string | undefined {
+  const kept = parts.filter((p): p is string => Boolean(p && p.trim()));
+  if (kept.length === 0) return undefined;
+  if (kept.length === 1) return kept[0];
+  return kept.map((p) => `(${p})`).join(" and ");
+}
+
+/** Round to cents so accumulated floating point noise does not reach the caller. */
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/**
+ * Register the procurement inventory tools (warehouses, bins, on-hand scan,
+ * and inventory adjustments) on the MCP server.
+ *
+ * @param server MCP server to register tools on.
+ * @param client ConnectWise Manage client used by the tools.
+ */
 export function registerProcurementTools(server: McpServer, client: CwManageClient) {
   // -------------------------------------------------------------------------
   // Warehouse structure
@@ -349,7 +430,7 @@ export function registerProcurementTools(server: McpServer, client: CwManageClie
 
   server.tool(
     "cw_create_adjustment",
-    "Create an inventory adjustment header in ConnectWise Manage and return its ID. This writes the header only and moves no stock: add lines with cw_add_adjustment_detail, then post it with cw_close_adjustment. An open adjustment has no effect on on-hand quantities, so it is safe to leave one open and delete it in ConnectWise if the plan changes. ConnectWise has no 'summary' field on an adjustment: the free-text fields are reason (max 100 characters, which is what shows in the adjustment list) and notes (unbounded).",
+    "Create an inventory adjustment header in ConnectWise Manage and return its ID. This writes the header only and moves no stock: add lines with cw_add_adjustment_detail, then post it with cw_close_adjustment. The open header stays open until someone deletes it in the ConnectWise UI. This server has no delete tool. Do not call cw_close_adjustment unless the user intends to post stock. ConnectWise has no 'summary' field on an adjustment: the free-text fields are reason (max 100 characters, which is what shows in the adjustment list) and notes (unbounded).",
     {
       identifier: z
         .string()
@@ -515,6 +596,25 @@ export function registerProcurementTools(server: McpServer, client: CwManageClie
       id: z.number().describe("Adjustment ID to close and post"),
     },
     async ({ id }) => {
+      const adjustment = await client.get<{ closedFlag?: boolean | null }>(
+        `/procurement/adjustments/${id}`,
+      );
+      if (adjustment?.closedFlag === true) {
+        throw new Error(
+          `Adjustment ${id} is already closed and has posted. Do not patch closedFlag again. Reverse a posted adjustment with a counter-adjustment.`,
+        );
+      }
+
+      const details = await fetchAllPages<Record<string, unknown>>(
+        client,
+        `/procurement/adjustments/${id}/details`,
+      );
+      if (details.length === 0) {
+        throw new Error(
+          `Adjustment ${id} has no detail lines. Add lines with cw_add_adjustment_detail before closing, and do not close unless the user intends to post stock.`,
+        );
+      }
+
       const result = await client.patch(`/procurement/adjustments/${id}`, [
         { op: "replace", path: "closedFlag", value: true },
       ]);
