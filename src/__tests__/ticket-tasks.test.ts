@@ -8,7 +8,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../worker.js";
-import { toLeanTicketTask } from "../tools/ticket-tasks.js";
+import { buildTicketTaskPatch, toLeanTicketTask } from "../tools/ticket-tasks.js";
 
 const headers = {
   Accept: "application/json, text/event-stream",
@@ -182,5 +182,192 @@ describe("cw_get_ticket_tasks", () => {
 
     expect(result.isError).toBe(true);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("buildTicketTaskPatch", () => {
+  it("builds replace operations for closedFlag and notes only", () => {
+    expect(buildTicketTaskPatch({ closedFlag: true, notes: "Done today" })).toEqual([
+      { op: "replace", path: "closedFlag", value: true },
+      { op: "replace", path: "notes", value: "Done today" },
+    ]);
+  });
+
+  it("builds nothing when neither field is given", () => {
+    expect(buildTicketTaskPatch({})).toEqual([]);
+  });
+});
+
+describe("cw_update_ticket_task", () => {
+  /** Every request the tool made, in order. */
+  function requests(fetchMock: ReturnType<typeof vi.fn>) {
+    return fetchMock.mock.calls.map(([url, init]) => ({
+      path: new URL(url).pathname,
+      method: init.method,
+      body: init.body ? JSON.parse(init.body) : undefined,
+    }));
+  }
+
+  const taskPath = "/v4_6_release/apis/3.0/service/tickets/77/tasks/501";
+
+  it("is registered as a write and accepts only ticketId, id, closedFlag, notes and confirm", async () => {
+    const tool = (await listTools()).find((entry) => entry.name === "cw_update_ticket_task")!;
+    expect(tool).toBeDefined();
+    expect(tool.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    expect(Object.keys(tool.inputSchema.properties)).toEqual([
+      "ticketId",
+      "id",
+      "closedFlag",
+      "notes",
+      "confirm",
+    ]);
+    expect(tool.inputSchema.required).toEqual(["ticketId", "id"]);
+  });
+
+  it("closes a task with confirm: true, then reads it back", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(cwTask({ closedFlag: true })))
+      .mockResolvedValueOnce(jsonResponse(cwTask({ closedFlag: true })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await call("cw_update_ticket_task", {
+      ticketId: 77,
+      id: 501,
+      closedFlag: true,
+      confirm: true,
+    });
+
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      saved: true,
+      verified: true,
+      ticketId: 77,
+      task: { id: 501, notes: "Clear the inbox", closedFlag: true, priority: 1, resolution: "" },
+    });
+    expect(requests(fetchMock)).toEqual([
+      {
+        path: taskPath,
+        method: "PATCH",
+        body: [{ op: "replace", path: "closedFlag", value: true }],
+      },
+      { path: taskPath, method: "GET", body: undefined },
+    ]);
+  });
+
+  it("returns the fresh read, not the PATCH response", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(cwTask({ notes: "from the patch response" })))
+      .mockResolvedValueOnce(jsonResponse(cwTask({ notes: "New text" })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await call("cw_update_ticket_task", {
+      ticketId: 77,
+      id: 501,
+      notes: "New text",
+      confirm: true,
+    });
+
+    expect(JSON.parse(result.content[0].text).task.notes).toBe("New text");
+  });
+
+  it("sends only closedFlag and notes, and drops any other field the caller passes", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(cwTask({ closedFlag: true, notes: "New text" })))
+      .mockResolvedValueOnce(jsonResponse(cwTask({ closedFlag: true, notes: "New text" })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await call("cw_update_ticket_task", {
+      ticketId: 77,
+      id: 501,
+      closedFlag: true,
+      notes: "New text",
+      priority: 9,
+      resolution: "sneaked in",
+      schedule: { id: 1 },
+      confirm: true,
+    });
+
+    expect(requests(fetchMock)[0].body).toEqual([
+      { op: "replace", path: "closedFlag", value: true },
+      { op: "replace", path: "notes", value: "New text" },
+    ]);
+  });
+
+  it.each([
+    ["confirm omitted", {}],
+    ["confirm false", { confirm: false }],
+  ])("makes no request and reports the planned change with %s", async (_label, extra) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await call("cw_update_ticket_task", {
+      ticketId: 77,
+      id: 501,
+      closedFlag: true,
+      ...extra,
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      saved: false,
+      ticketId: 77,
+      taskId: 501,
+      planned: [{ op: "replace", path: "closedFlag", value: true }],
+    });
+  });
+
+  it("makes no request when neither closedFlag nor notes is given", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await call("cw_update_ticket_task", { ticketId: 77, id: 501, confirm: true });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/Nothing to update/);
+  });
+
+  it("reports an error when the read-back does not match what was sent", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(cwTask({ closedFlag: true })))
+      .mockResolvedValueOnce(jsonResponse(cwTask({ closedFlag: false })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await call("cw_update_ticket_task", {
+      ticketId: 77,
+      id: 501,
+      closedFlag: true,
+      confirm: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      saved: true,
+      verified: false,
+      mismatches: ["closedFlag"],
+    });
+  });
+
+  it("fails without a read-back when ConnectWise refuses the write", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "Forbidden", message: "no access" }, 403));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await call("cw_update_ticket_task", {
+      ticketId: 77,
+      id: 501,
+      closedFlag: true,
+      confirm: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/403/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
