@@ -1,26 +1,43 @@
 # Release path
 
-How merged code reaches the running ConnectWise connector on the owner's machine.
-Recorded 11/10/2026 for WS1 item 4 of the ConnectWise MCP tool batch runbook. Ruling D6.
+How merged code reaches the running ConnectWise connector.
+Recorded 11/10/2026 for WS1 item 4 of the ConnectWise MCP tool batch runbook. Rulings D6
+and D27. Updated 12/10/2026.
 
 ## Purpose and scope
 
 This document records how the installed connector runs, and gives the procedure to
-release a merged change to it. It covers one machine: the owner's Windows workstation
-with Claude Desktop. It does not cover the Cloudflare Worker or the HTTP gateway mode.
+release a merged change to it. It covers two machines, per D27: Stephan's and Nathan's.
+Each person runs the connector on their own ConnectWise keys. Other staff keep the
+install they run today. It does not cover the Cloudflare Worker or the HTTP gateway mode.
 
 ## How the connector runs
 
 | Item | Value |
 |---|---|
 | Transport | stdio. `MCP_TRANSPORT` defaults to `stdio`, and the process has no listening port |
-| Launcher | Claude Desktop (`claude.exe`) starts `node.exe` with the path to `dist\index.js` |
-| Config entry | Hand-edited entry in the Claude Desktop config. It is not an installed `.mcpb` extension |
+| Launcher | A client starts `node.exe` with the path to `dist\index.js`. See "Clients per machine" |
+| Config entry | Hand-edited entry in the client's config. In Claude Desktop it is not an installed `.mcpb` extension |
 | Build | A local `tsc` build. It is not a published package |
-| Process count | Two copies were running on 11/10/2026, both started 10/10/2026 |
+| Process count | Claude Desktop runs two copies on Stephan's machine |
 
 How this was found: a live process check of the script path and the listening ports. No
-one read the config file for this record.
+one read a config file for this record.
+
+## Clients per machine
+
+More than one client can start the connector on one machine. Each client has its own
+connector entry. Repoint and restart every client in this table, not one.
+
+| Machine | Client | Connector entry points at | Status |
+|---|---|---|---|
+| Stephan | Claude Desktop (`claude.exe`) | Release build | Verified 12/10/2026 07:34 at `eba6995`. `cw_test_connection` passed and CW ticket 904995 read |
+| Stephan | Codex (`codex.exe`, under the ChatGPT app) | Dev repo `dist`, as seen 11/10/2026 16:21 | Repoint not yet verified |
+| Nathan | Not yet recorded | Not yet recorded | Not yet on the release path |
+
+Add a row when a new client starts the connector. To find clients, list the `node.exe`
+processes whose command line ends in `dist\index.js`. Then read the parent process of
+each.
 
 Because the transport is stdio, upstream issues #101 (SSRF through `X-CW-Url`) and #102
 (Host header crash) cannot be reached on this install. They apply only to the HTTP
@@ -33,13 +50,14 @@ server and gateway mode. The fixes are still made, because the code ships to oth
 | Dev repo | `C:\Dev\GitHub\connectwise-manage-mcp`. All branch work and test builds happen here |
 | Release worktree | `C:\Dev\GitHub\connectwise-manage-mcp-release`. A git worktree of the dev repo, detached at `origin/main` |
 | Release build | The `dist` folder inside the release worktree |
-| Connector entry | The ConnectWise entry in the Claude Desktop config |
+| Client | A program that starts the connector, for example Claude Desktop or Codex |
+| Connector entry | The ConnectWise entry in the config of one client. Each client has its own |
 
 ## The problem this solves
 
 Before Procedure A, the connector entry pointed at the dev repo's own `dist\index.js`. Any
 build in the dev repo, including a build of an unmerged branch, became live at the next
-restart of Claude Desktop. A test gate on a feature branch was enough to do it.
+restart of a client. A test gate on a feature branch was enough to do it.
 
 The release worktree separates the two. A build in the dev repo no longer changes what
 the connector runs.
@@ -104,17 +122,17 @@ Run each command in PowerShell.
    git -C C:\Dev\GitHub\connectwise-manage-mcp-release log -1 --format="%h %s"
    ```
 
-6. Owner: change the `args` of the connector entry to
+6. Owner: for each client on the machine, change the `args` of its connector entry to
    `C:\Dev\GitHub\connectwise-manage-mcp-release\dist\index.js`. Change nothing else.
-7. Owner: quit Claude Desktop fully, then start it again.
-8. Run `cw_test_connection` from a Claude Desktop session.
+7. Owner: quit each client fully, then start it again.
+8. Run `cw_test_connection` from a session in each client.
 
 **Acceptance**
 
 - Step 5 shows the head commit of `origin/main`.
 - `C:\Dev\GitHub\connectwise-manage-mcp-release\dist\index.js` exists.
-- `cw_test_connection` passes.
-- The running `node.exe` processes show the release path, not the dev repo path.
+- `cw_test_connection` passes in each client.
+- Every running connector process shows the release path, not the dev repo path.
 
 ## Procedure B: release a merged change
 
@@ -158,14 +176,14 @@ Run each command in PowerShell.
    Verification: the command ends with no error, and the time stamp of `dist\index.js`
    is new. A failed build can leave the old `dist` in place.
 
-6. Owner: quit Claude Desktop fully, then start it again. The connector loads new tools
+6. Owner: quit each client fully, then start it again. The connector loads new tools
    only at start.
-7. Run `cw_test_connection`, then read one known CW ticket.
+7. Run `cw_test_connection`, then read CW ticket 904995.
 
 **Acceptance**
 
 - The release worktree is at the head commit of `origin/main`.
-- `cw_test_connection` passes and the CW ticket read returns.
+- `cw_test_connection` passes and the read of CW ticket 904995 returns.
 - A tool added by the merge shows in the tool list.
 
 ## Recovery
@@ -173,7 +191,7 @@ Run each command in PowerShell.
 | If | Then |
 |---|---|
 | `npm run build` fails with `tsc` not found | Run the install again with `--include=dev`, then build again |
-| The build fails for another reason | Do not restart Claude Desktop. The connector keeps the build it loaded at start. Report the error |
+| The build fails for another reason | Do not restart any client. The connector keeps the build it loaded at start. Report the error |
 | `cw_test_connection` fails after a release | Roll back: run `git -C C:\Dev\GitHub\connectwise-manage-mcp-release checkout --detach <commit from step 2>`, then steps 4 to 7 of Procedure B |
 | The connector returns a 403 | Stop and report it. Do not use another person's keys |
 | `git worktree add` says the folder exists | Stop. Do not delete the folder. Check what it holds first |
