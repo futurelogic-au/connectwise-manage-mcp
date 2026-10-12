@@ -38,6 +38,7 @@ For deploying to **Azure Container Apps** with Entra ID OAuth 2.1, see [AZURE_AC
 | `CW_MANAGE_CLIENT_ID` | Yes | Client ID from [ConnectWise Developer Portal](https://developer.connectwise.com/) |
 | `CW_MANAGE_URL` | No | API base URL (see below) |
 | `CW_MANAGE_REJECT_UNAUTHORIZED` | No | Set to `false` for self-signed certs (default: `true`) |
+| `CW_MANAGE_ATTACH_ROOT` | No | Folder `cw_attach_document` may read a receipt from. Unset means no file is attached. Files outside it, including through a link, are refused |
 | `MCP_TRANSPORT` | No | `stdio` (default) or `http` |
 | `MCP_HTTP_PORT` | No | HTTP port (default: `8080`) |
 | `AUTH_MODE` | No | `env` (default) or `gateway` for header-based auth |
@@ -122,7 +123,7 @@ needed.
 ### Time Entries
 - `cw_search_time_entries` — Search time entries
 - `cw_get_time_entry` — Get a time entry by ID
-- `cw_create_time_entry`: Create a new time entry. `billableOption` (`Billable`, `DoNotBill`, `NoCharge` or `NoDefault`) is set at creation, so no patch is needed. `timeSheetId` adds time to a submitted or past period, which ConnectWise otherwise refuses with "time period not open". A closed ticket refuses new time: the tool says so and never reopens the ticket
+- `cw_create_time_entry`: Create a new time entry. `billableOption` (`Billable`, `DoNotBill`, `NoCharge` or `NoDefault`) is set at creation, so no patch is needed. `timeSheetId` adds time to a submitted or past period, which ConnectWise otherwise refuses with "time period not open". A closed ticket refuses new time: the tool says so and never reopens the ticket. Needs `confirm: true`; without it nothing is written and the planned body is returned
 - `cw_update_time_entry` — Correct a time entry (JSON Patch on `PATCH /time/entries/{id}`). Use this to fix `actualHours` when a metered agreement rounds to 0.25.
 - `cw_delete_time_entry` — Delete a time entry (`DELETE /time/entries/{id}`). Manage rejects deletes of entries that are already billed.
 
@@ -162,10 +163,20 @@ needed.
 - `cw_update_agreement_addition_product`: Repoint one addition to a different product, holding its billing values steady. **Changes live billing**, so it defaults to a dry run
 - `cw_search_agreement_recaps` — Search agreement billing recaps (used, remaining, overrun, next invoice)
 - `cw_get_agreement_recap` — Get the billing recap for one agreement
+- `cw_list_agreement_exclusions`: List the work role and work type exclusions on an agreement, with the exclusion ID of each
+- `cw_add_agreement_exclusion`: Exclude one work role or one work type from an agreement. Needs `confirm: true`, skips an exclusion already there, and reads the list back
+- `cw_delete_agreement_exclusion`: Remove one exclusion row from an agreement, never the agreement. Needs `confirm: true`, lists first, and reads the list back
 
 ConnectWise exposes additions only as children of a single agreement, with no cross-agreement additions endpoint, so `cw_search_agreement_additions` iterates agreements and queries each one. A full scan costs roughly one API call per agreement and is slow on a large instance: narrow it with `agreementConditions`, or set `maxAgreements` to sanity check the query first. Active agreements only by default, and additions whose `cancelledDate` has already passed are excluded unless asked for.
 
 `cw_update_agreement_addition_product` repoints the product and, in the same PATCH, re-sends `unitPrice`, `unitCost`, `quantity`, `invoiceDescription`, `taxableFlag` and `billCustomer` at their pre-change values, because ConnectWise otherwise defaults them from the new catalog item and silently reprices the line. It reads the addition back afterwards and returns a before/after comparison of every field, flagging anything that changed other than the product. `dryRun` defaults to `true` and returns the planned PATCH without sending it.
+
+### Expenses
+- `cw_list_expense_types`: List expense types (inactive left out unless asked), with the ID the claim needs
+- `cw_list_charge_codes`: List charge codes, with the ID the claim needs
+- `cw_search_expense_entries`: Search the owner's own expense entries by date range and amount. The member is the one the connector's keys belong to (`/system/myAccount`); another member's ID is refused
+- `cw_create_expense_entry`: Create one expense entry for the owner. `expenseTypeId` and `chargeCodeId` are required with no default, and `merchant` is required and written at the start of the notes. A duplicate check on date, amount and merchant runs first and a match is refused. Needs `confirm: true` and reads the entry back. There is no expense delete tool
+- `cw_attach_document`: Attach a receipt (`.pdf`, `.png`, `.jpg`, `.jpeg`, at most 10 MiB) to one of the owner's expense entries through `POST /system/documents`. The file is read from disk under `CW_MANAGE_ATTACH_ROOT` and is never moved, renamed or filed. Needs `confirm: true`, skips a file already on the entry, and reads the entry's documents back
 
 ### Invoices
 - `cw_search_invoices` — Search invoices (CW `conditions`, `orderBy` e.g. `id desc`)
