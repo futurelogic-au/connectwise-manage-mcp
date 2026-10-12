@@ -11,8 +11,12 @@ import { fetchAllPages } from "./paging.js";
  *   member id in CW_MANAGE_MEMBER_ID, set per person in that person's own
  *   connector entry. Unset, the expense tools refuse. (GET /system/myAccount
  *   answers 404 on ConnectWise v2025.1, so it is not used anywhere.)
- * - The expense type is a required parameter, with no default. The charge
- *   code is optional: omitted, no charge-to is sent (D22, ruled 12/10/2026).
+ * - The expense type is a required parameter, with no default. Every claim
+ *   needs a charge-to: exactly one of chargeCodeId or companyId, with no
+ *   default (D22, amended 12/10/2026). A charge code goes as chargeToType
+ *   ChargeCode with chargeToId. A company goes as the entry's company
+ *   reference, which is what ConnectWise's expense entry model asks for when
+ *   there is no charge-to type.
  * - Create needs confirm: true, and a duplicate check on date, amount and
  *   merchant runs first (D24). There is no delete tool.
  * - A receipt is read from disk and uploaded. It is never moved, renamed or
@@ -59,6 +63,7 @@ interface ExpenseRecord {
   billableOption?: string | null;
   member?: Ref | null;
   type?: Ref | null;
+  company?: Ref | null;
   expenseReport?: Ref | null;
 }
 
@@ -72,6 +77,7 @@ function leanExpense(record: ExpenseRecord) {
     status: record.status ?? null,
     chargeToType: record.chargeToType ?? null,
     chargeToId: record.chargeToId ?? null,
+    company: record.company ? { id: record.company.id ?? null, name: record.company.name ?? null } : null,
     billableOption: record.billableOption ?? null,
     expenseReportId: record.expenseReport?.id ?? null,
     memberId: record.member?.id ?? null,
@@ -176,7 +182,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
 
   server.tool(
     "cw_list_charge_codes",
-    "List charge codes (GET /time/chargeCodes), with the ID that cw_create_expense_entry takes as the optional chargeCodeId. Read-only.",
+    "List charge codes (GET /time/chargeCodes), with the ID that cw_create_expense_entry takes as chargeCodeId. Read-only.",
     {},
     READ_ONLY,
     async () => {
@@ -191,7 +197,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
 
   server.tool(
     "cw_search_expense_entries",
-    "Search the owner's own expense entries (GET /expense/entries). Own claims only: the member is the owner's member id from the CW_MANAGE_MEMBER_ID environment variable, a different memberId is refused, and with the variable unset nothing is read. Filter by dateFrom and dateTo (YYYY-MM-DD) and amount. Each row is lean: id, date, amount, type, notes, status, chargeToType, chargeToId, billableOption, expenseReportId and memberId. Read-only.",
+    "Search the owner's own expense entries (GET /expense/entries). Own claims only: the member is the owner's member id from the CW_MANAGE_MEMBER_ID environment variable, a different memberId is refused, and with the variable unset nothing is read. Filter by dateFrom and dateTo (YYYY-MM-DD) and amount. Each row is lean: id, date, amount, type, notes, status, chargeToType, chargeToId, company, billableOption, expenseReportId and memberId. Read-only.",
     {
       memberId: z
         .number()
@@ -233,7 +239,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
 
   server.tool(
     "cw_create_expense_entry",
-    "Create one expense entry for the owner (POST /expense/entries). Own claims only: the member is the id in CW_MANAGE_MEMBER_ID, and with it unset nothing is written. expenseTypeId is required and has no default: read it with cw_list_expense_types. chargeCodeId is optional, from cw_list_charge_codes: omitted, no charge-to is sent and the entry has none. The merchant is required and is written at the start of the notes, because an expense entry has no merchant field: notes of 'Petrol' for the merchant 'Ampol' are stored as 'Ampol, Petrol'. A duplicate check runs first on the owner's entries for the same date, same amount and a note naming the same merchant: a match is refused and nothing is written. Requires confirm: true. Without it nothing is written and the plan, with the duplicate check, is returned. After the write the entry is read back. There is no delete tool: a claim made in error is removed by hand in ConnectWise.",
+    "Create one expense entry for the owner (POST /expense/entries). Own claims only: the member is the id in CW_MANAGE_MEMBER_ID, and with it unset nothing is written. expenseTypeId is required and has no default: read it with cw_list_expense_types. Every claim needs a charge-to: pass exactly one of chargeCodeId (from cw_list_charge_codes) and companyId, with no default. Neither, or both, is refused and nothing is written. The merchant is required and is written at the start of the notes, because an expense entry has no merchant field: notes of 'Petrol' for the merchant 'Ampol' are stored as 'Ampol, Petrol'. A duplicate check runs first on the owner's entries for the same date, same amount and a note naming the same merchant: a match is refused and nothing is written. Requires confirm: true. Without it nothing is written and the plan, with the duplicate check, is returned. After the write the entry is read back. There is no delete tool: a claim made in error is removed by hand in ConnectWise.",
     {
       expenseTypeId: z.number().int().positive().describe("Expense type ID, from cw_list_expense_types. Required, no default"),
       chargeCodeId: z
@@ -241,7 +247,13 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
         .int()
         .positive()
         .optional()
-        .describe("Charge code ID, from cw_list_charge_codes. Optional: omitted, no charge-to is sent"),
+        .describe("Charge code ID, from cw_list_charge_codes. Pass this or companyId, not both"),
+      companyId: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Company ID to charge the claim to. Pass this or chargeCodeId, not both"),
       amount: z.number().positive().describe("Amount claimed, in dollars"),
       date: z.string().regex(DATE_PATTERN).describe("Date of the expense, YYYY-MM-DD"),
       merchant: z.string().trim().min(2).describe("Who was paid. Used for the duplicate check and written into the notes"),
@@ -260,6 +272,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
     async ({
       expenseTypeId,
       chargeCodeId,
+      companyId,
       amount,
       date,
       merchant,
@@ -268,6 +281,15 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
       billableOption,
       confirm,
     }) => {
+      // Every claim needs a charge-to: exactly one of a charge code or a company.
+      if ((chargeCodeId === undefined) === (companyId === undefined)) {
+        return refused(
+          chargeCodeId === undefined
+            ? "A claim needs a charge-to. Pass exactly one of chargeCodeId and companyId. Nothing was written."
+            : "Pass exactly one of chargeCodeId and companyId, not both. Nothing was written.",
+        );
+      }
+
       const member = ownMemberId();
       if ("message" in member) return refused(member.message);
       const own = member.id;
@@ -281,10 +303,12 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
         date: `${date}T00:00:00Z`,
         notes: noteText,
       };
-      // No charge code, no charge-to: neither field is sent.
       if (chargeCodeId !== undefined) {
         body.chargeToType = "ChargeCode";
         body.chargeToId = chargeCodeId;
+      } else {
+        // No charge-to type: the entry's company reference is the charge-to.
+        body.company = { id: companyId };
       }
       if (paymentMethodId !== undefined) body.paymentMethod = { id: paymentMethodId };
       if (billableOption !== undefined) body.billableOption = billableOption;
@@ -340,6 +364,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
       if (typeof fresh.amount !== "number" || Math.abs(fresh.amount - amount) >= 0.005) mismatches.push("amount");
       if (fresh.type?.id !== expenseTypeId) mismatches.push("type");
       if (chargeCodeId !== undefined && fresh.chargeToId !== chargeCodeId) mismatches.push("chargeCode");
+      if (companyId !== undefined && fresh.company?.id !== companyId) mismatches.push("company");
       if (fresh.member?.id !== own) mismatches.push("member");
       if (!onDate(fresh.date, date)) mismatches.push("date");
       const verified = mismatches.length === 0;
