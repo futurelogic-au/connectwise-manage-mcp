@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CwManageClient } from "../api-client.js";
+import { CwManageClient, hasApiStatus } from "../api-client.js";
 
 /**
  * Schedule entries book a member's time against a ticket, activity or project.
@@ -52,9 +52,45 @@ const schedulePatchOperation = z.discriminatedUnion("op", [
   }),
 ]);
 
+/** Perth (AWST) is UTC+8 with no daylight saving, so a Perth time is UTC plus eight hours. */
+export function formatPerth(iso: string): string {
+  const instant = new Date(iso);
+  if (Number.isNaN(instant.getTime())) return iso;
+  const perth = new Date(instant.getTime() + 8 * 60 * 60 * 1000);
+  const two = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${two(perth.getUTCDate())}/${two(perth.getUTCMonth() + 1)}/${perth.getUTCFullYear()} ` +
+    `${two(perth.getUTCHours())}:${two(perth.getUTCMinutes())}`
+  );
+}
+
+interface NamedRef {
+  id?: number;
+  name?: string;
+  identifier?: string;
+}
+
+/** The linked ticket a schedule entry books against, by its schedule type. */
+export function linkedTicketPath(entry: { objectId?: unknown; type?: NamedRef | null }): {
+  kind: "service" | "project";
+  id: number;
+  notesPath: string;
+} | null {
+  if (typeof entry.objectId !== "number") return null;
+  const identifier = entry.type?.identifier?.toUpperCase();
+  const name = entry.type?.name?.toLowerCase();
+  if (identifier === "S" || name === "service") {
+    return { kind: "service", id: entry.objectId, notesPath: `/service/tickets/${entry.objectId}/notes` };
+  }
+  if (identifier === "P" || name === "project") {
+    return { kind: "project", id: entry.objectId, notesPath: `/project/tickets/${entry.objectId}/notes` };
+  }
+  return null;
+}
+
 /**
  * Register the schedule entry tools (search, list types and statuses, create,
- * and JSON Patch update) on the MCP server. There is deliberately no delete tool.
+ * JSON Patch update, and a guarded delete) on the MCP server.
  *
  * @param server MCP server to register tools on.
  * @param client ConnectWise Manage client used by the tools.
@@ -261,7 +297,7 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
 
   server.tool(
     "cw_update_schedule_entry",
-    "Update an existing schedule entry using JSON Patch operations. Use this to move a booking, change its status, or mark it done. There is deliberately no delete tool: removing booked time stays a manual action in ConnectWise. " +
+    "Update an existing schedule entry using JSON Patch operations. Use this to move a booking, change its status, or mark it done. To remove a wrong booking use cw_delete_schedule_entry, which only deletes a future entry that is not done and leaves a note on the ticket. " +
       UTC_NOTE,
     {
       id: z.number().describe("Schedule entry ID"),
@@ -271,6 +307,191 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
     async ({ id, operations }) => {
       const result = await client.patch(`/schedule/entries/${id}`, operations);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "cw_delete_schedule_entry",
+    "Delete a wrong booking (Manage DELETE /schedule/entries/{id}). Only a future schedule entry that is not done is deleted. A done entry, an entry that has started, or an entry with time logged against it is refused, and so is an entry that is not booked against a service ticket or a project ticket, because the delete is recorded as an internal note on that ticket. Requires confirm: true and a reason. Without confirm: true nothing is written and the plan is returned. After the delete the tool adds an internal note to the linked ticket naming the member, the original date and time in Perth time, and the reason, then reads the entry and the note back.",
+    {
+      id: z.number().int().positive().describe("Schedule entry ID"),
+      reason: z
+        .string()
+        .trim()
+        .min(3)
+        .describe("Why the booking is being deleted. Written into the ticket note"),
+      confirm: z
+        .boolean()
+        .optional()
+        .describe("Must be true for the delete to happen. Omitted or false makes no write"),
+    },
+    SCHEDULE_WRITE,
+    async ({ id, reason, confirm }) => {
+      const entryPath = `/schedule/entries/${id}`;
+      const refuse = (why: string, extra: Record<string, unknown> = {}) => ({
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ deleted: false, refused: true, id, message: why, ...extra }, null, 2),
+          },
+        ],
+        isError: true,
+      });
+
+      let entry: Record<string, unknown>;
+      try {
+        entry = await client.get<Record<string, unknown>>(entryPath);
+      } catch (err: unknown) {
+        if (hasApiStatus(err, 404)) return refuse(`Schedule entry ${id} was not found. Nothing was changed.`);
+        throw err;
+      }
+
+      const member = entry.member as NamedRef | undefined;
+      const dateStart = typeof entry.dateStart === "string" ? entry.dateStart : undefined;
+      const dateEnd = typeof entry.dateEnd === "string" ? entry.dateEnd : undefined;
+      const summary = {
+        id,
+        member: member ? { id: member.id ?? null, name: member.name ?? null } : null,
+        dateStart: dateStart ?? null,
+        dateEnd: dateEnd ?? null,
+        objectId: typeof entry.objectId === "number" ? entry.objectId : null,
+        type: (entry.type as NamedRef | undefined)?.name ?? null,
+      };
+
+      // D9: future, not-done entries only.
+      if (entry.doneFlag === true) {
+        return refuse(`Schedule entry ${id} is marked done, so it is not deleted. Nothing was changed.`, { entry: summary });
+      }
+      const startMs = dateStart ? Date.parse(dateStart) : NaN;
+      if (Number.isNaN(startMs)) {
+        return refuse(`Schedule entry ${id} has no start date, so it cannot be judged as a future booking. Nothing was changed.`, { entry: summary });
+      }
+      if (startMs <= Date.now()) {
+        return refuse(
+          `Schedule entry ${id} started at ${formatPerth(dateStart!)} Perth time, which is not in the future, so it is not deleted. Nothing was changed.`,
+          { entry: summary },
+        );
+      }
+
+      // The delete is recorded on the linked ticket, so there has to be one.
+      const linked = linkedTicketPath(entry as { objectId?: unknown; type?: NamedRef | null });
+      if (!linked) {
+        return refuse(
+          `Schedule entry ${id} is not booked against a service ticket or a project ticket, so there is no ticket to carry the note. Nothing was changed.`,
+          { entry: summary },
+        );
+      }
+
+      // Time against it: a time entry for the same member on the same ticket inside the booking.
+      if (member?.id !== undefined && dateEnd) {
+        const timeEntries = await client.get<Array<{ id?: number }>>("/time/entries", {
+          conditions: `chargeToId = ${linked.id} and member/id = ${member.id} and timeStart >= [${dateStart}] and timeStart <= [${dateEnd}]`,
+          pageSize: 5,
+        });
+        if (Array.isArray(timeEntries) && timeEntries.length > 0) {
+          return refuse(
+            `Schedule entry ${id} has time logged against it (time entry ${timeEntries.map((t) => t.id).join(", ")}), so it is not deleted. Nothing was changed.`,
+            { entry: summary, timeEntryIds: timeEntries.map((t) => t.id ?? null) },
+          );
+        }
+      }
+
+      const who = member?.name ? `${member.name}${member.identifier ? ` (${member.identifier})` : ""}` : `member ${member?.id ?? "unknown"}`;
+      const noteText =
+        `Schedule entry ${id} was deleted. Member: ${who}. ` +
+        `Was booked: ${formatPerth(dateStart!)} to ${dateEnd ? formatPerth(dateEnd) : "unknown"} Perth time (AWST). ` +
+        `Reason: ${reason}`;
+
+      if (confirm !== true) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  deleted: false,
+                  message: "No write was made. Pass confirm: true to delete this booking.",
+                  entry: summary,
+                  note: { ticketKind: linked.kind, ticketId: linked.id, text: noteText },
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      await client.delete(entryPath);
+
+      // The entry is gone. Add the note, then read both back.
+      let noteId: number | null = null;
+      let noteError: string | undefined;
+      try {
+        const created = await client.post<Record<string, unknown>>(linked.notesPath, {
+          text: noteText,
+          internalAnalysisFlag: true,
+        });
+        noteId = typeof created?.id === "number" ? created.id : null;
+      } catch (err: unknown) {
+        noteError = err instanceof Error ? err.message : String(err);
+      }
+
+      let entryGone = false;
+      try {
+        await client.get(entryPath);
+      } catch (err: unknown) {
+        entryGone = hasApiStatus(err, 404);
+      }
+
+      let noteReadBack = false;
+      if (noteId !== null) {
+        try {
+          const notes = await client.get<Array<{ id?: number }>>(linked.notesPath, {
+            pageSize: 10,
+            orderBy: "id desc",
+          });
+          noteReadBack = Array.isArray(notes) && notes.some((n) => n.id === noteId);
+        } catch {
+          /* reported as not read back */
+        }
+      }
+
+      const ok = entryGone && noteId !== null && noteReadBack;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                deleted: true,
+                verified: ok,
+                entryGone,
+                entry: summary,
+                note: {
+                  added: noteId !== null,
+                  id: noteId,
+                  readBack: noteReadBack,
+                  ticketKind: linked.kind,
+                  ticketId: linked.id,
+                  text: noteText,
+                  ...(noteError ? { error: noteError } : {}),
+                },
+                ...(noteId === null
+                  ? {
+                      warning:
+                        "The booking was deleted but the ticket note was not added. Add the note text above to the ticket by hand.",
+                    }
+                  : {}),
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: !ok,
+      };
     },
   );
 }

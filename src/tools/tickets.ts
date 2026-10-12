@@ -15,6 +15,12 @@ import {
   ticketPatchOperationSchema,
   toLeanTicket,
 } from "./ticket-lean.js";
+import {
+  findInactiveCompany,
+  inactiveCompanyMessage,
+  isInactiveCompanyError,
+  touchesCompany,
+} from "./ticket-company.js";
 
 /** Most tickets one cw_bulk_update_tickets call will change. Calls run in sequence. */
 const BULK_TICKET_LIMIT = 25;
@@ -193,14 +199,35 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
       if (initialDescription) body.initialDescription = initialDescription;
       if (parentTicketId !== undefined) body.parentTicketId = parentTicketId;
 
-      const result = await client.post("/service/tickets", body);
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      try {
+        const result = await client.post("/service/tickets", body);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (err: unknown) {
+        // D12: name the company and its status instead of passing the bare 400.
+        if (!isInactiveCompanyError(err)) throw err;
+        const finding = await findInactiveCompany(client, { companyId });
+        return {
+          content: [
+            jsonText({
+              saved: false,
+              reason: "inactive-company",
+              message: inactiveCompanyMessage(finding, {
+                verb: "created",
+                remedy: "Create the ticket with a company that is active.",
+              }),
+              company: finding.company,
+              companyStatus: finding.status,
+            }),
+          ],
+          isError: true,
+        };
+      }
     },
   );
 
   server.tool(
     "cw_update_ticket",
-    `Update an existing service ticket using JSON Patch operations. ${LEAN_DESCRIPTION} Without lean the response is the full saved ticket, which is large.`,
+    `Update an existing service ticket using JSON Patch operations. ${LEAN_DESCRIPTION} Without lean the response is the full saved ticket, which is large. A patch that changes the ticket's company needs confirm: true. If ConnectWise refuses the save because the ticket's company is in a status that does not allow saving a service ticket, nothing is changed and the reply names the company and its status. To move such a ticket, pass newCompanyId with confirm: true: the patch is then saved with the company changed in the same call.`,
     {
       id: z.number().describe("Ticket ID"),
       operations: z.array(ticketPatchOperationSchema).describe("Array of JSON Patch operations"),
@@ -208,11 +235,94 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
         .boolean()
         .optional()
         .describe("true returns the lean shape (id, summary, board, status, owner, company, _info.lastUpdated). Default: the full saved ticket"),
+      newCompanyId: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Company to move the ticket to, used only if the save is refused because its current company is inactive. Needs confirm: true"),
+      confirm: z
+        .boolean()
+        .optional()
+        .describe("Must be true to change the ticket's company, by an operation on company or by newCompanyId. Not needed for any other patch"),
     },
-    async ({ id, operations, lean }) => {
-      const result = await client.patch(`/service/tickets/${id}`, operations);
-      const shown = lean === true ? toLeanTicket(result) : result;
-      return { content: [jsonText(shown)] };
+    async ({ id, operations, lean, newCompanyId, confirm }) => {
+      const path = `/service/tickets/${id}`;
+      const show = (result: unknown, extra: Record<string, unknown> = {}) => {
+        const shown = lean === true ? toLeanTicket(result) : result;
+        const body =
+          Object.keys(extra).length > 0 && shown && typeof shown === "object"
+            ? { ...(shown as Record<string, unknown>), ...extra }
+            : shown;
+        return { content: [jsonText(body)] };
+      };
+
+      // A ticket is not moved off its company without confirm: true.
+      if (touchesCompany(operations) && confirm !== true) {
+        return {
+          content: [
+            jsonText({
+              saved: false,
+              message:
+                "No write was made. This patch changes the ticket's company. Pass confirm: true to apply it.",
+              ticketId: id,
+              planned: operations,
+            }),
+          ],
+          isError: true,
+        };
+      }
+
+      try {
+        return show(await client.patch(path, operations));
+      } catch (err: unknown) {
+        if (!isInactiveCompanyError(err)) throw err;
+
+        const finding = await findInactiveCompany(client, { ticketId: id });
+        if (newCompanyId === undefined || confirm !== true) {
+          return {
+            content: [
+              jsonText({
+                saved: false,
+                reason: "inactive-company",
+                message:
+                  inactiveCompanyMessage(finding, { ticketId: id }) +
+                  (newCompanyId !== undefined ? " newCompanyId was given but confirm: true was not." : ""),
+                company: finding.company,
+                companyStatus: finding.status,
+              }),
+            ],
+            isError: true,
+          };
+        }
+
+        // D12: a new company with confirm: true. Save the patch and the move together.
+        const moved = [...operations, { op: "replace" as const, path: "company/id", value: newCompanyId }];
+        try {
+          const result = await client.patch(path, moved);
+          return show(result, {
+            companyMoved: { from: finding.company, to: { id: newCompanyId } },
+          });
+        } catch (second: unknown) {
+          if (!isInactiveCompanyError(second)) throw second;
+          const target = await findInactiveCompany(client, { companyId: newCompanyId });
+          return {
+            content: [
+              jsonText({
+                saved: false,
+                reason: "inactive-company",
+                message:
+                  `Ticket ${id} was not saved. The company it was to move to, ${target.company?.name ?? `id ${newCompanyId}`}, ` +
+                  `is also in a status that does not allow saving a service ticket` +
+                  `${target.status?.name ? ` ("${target.status.name}")` : ""}. Nothing was changed.`,
+                company: target.company,
+                companyStatus: target.status,
+              }),
+            ],
+            isError: true,
+          };
+        }
+      }
     },
   );
 
@@ -277,7 +387,21 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
         try {
           await client.patch(path, operations);
         } catch (err: unknown) {
-          rows.push({ id, success: false, error: errorMessage(err) });
+          if (isInactiveCompanyError(err)) {
+            // D12: name the company and its status. Moving a ticket is a
+            // separate, confirmed call on cw_update_ticket.
+            const finding = await findInactiveCompany(client, { ticketId: id });
+            rows.push({
+              id,
+              success: false,
+              reason: "inactive-company",
+              error: inactiveCompanyMessage(finding, { ticketId: id }),
+              company: finding.company,
+              companyStatus: finding.status,
+            });
+          } else {
+            rows.push({ id, success: false, error: errorMessage(err) });
+          }
           continue;
         }
 
