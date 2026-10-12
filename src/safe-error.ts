@@ -6,14 +6,18 @@
  * caller gets the HTTP status and a reference id. The log line carries the
  * same reference, so an operator can match the two.
  *
- * One exception keeps a 400 usable: the caller needs to know which field
- * ConnectWise refused. For a 400 only, a short allowlist of fields is copied
- * out of a JSON body, each one size-limited.
+ * Two exceptions keep an error usable. Each copies a short allowlist of
+ * fields out of a JSON body, every string cleaned and size-limited:
+ *
+ * - 400: `code`, `message` and the per-field `errors`, so the caller can see
+ *   which field ConnectWise refused.
+ * - 403: `code` and `message` only, so the caller can see which permission
+ *   is missing.
  *
  * This module has no imports and is side-effect free.
  */
 
-/** Longest single string copied out of a 400 body. */
+/** Longest single string copied out of an error body, ellipsis included. */
 export const MAX_DETAIL_STRING = 200;
 /** Most entries copied out of the `errors` array of a 400 body. */
 export const MAX_DETAIL_ERRORS = 5;
@@ -28,7 +32,7 @@ export interface SafeFieldError {
   field?: string;
 }
 
-/** The fields of a ConnectWise 400 body that are safe to show. */
+/** The fields of a ConnectWise error body that are safe to show. */
 export interface SafeErrorDetail {
   code?: string;
   message?: string;
@@ -50,7 +54,7 @@ function safeString(value: unknown): string | undefined {
     .trim();
   if (cleaned === "") return undefined;
   return cleaned.length > MAX_DETAIL_STRING
-    ? `${cleaned.slice(0, MAX_DETAIL_STRING)}...`
+    ? `${cleaned.slice(0, MAX_DETAIL_STRING - 3)}...`
     : cleaned;
 }
 
@@ -68,12 +72,12 @@ function pick<K extends string>(source: unknown, keys: readonly K[]): Partial<Re
 /**
  * The safe detail of a failed response, or undefined when there is none.
  *
- * Only a 400 with a JSON object body yields detail. Every other status, and
- * any body that is not a JSON object (HTML, plain text, an array), yields
- * nothing.
+ * Only a 400 or a 403 with a JSON object body yields detail. A 403 yields
+ * `code` and `message` and never `errors`. Every other status, and any body
+ * that is not a JSON object (HTML, plain text, an array), yields nothing.
  */
 export function safeErrorDetail(status: number, body: string): SafeErrorDetail | undefined {
-  if (status !== 400) return undefined;
+  if (status !== 400 && status !== 403) return undefined;
 
   let parsed: unknown;
   try {
@@ -85,7 +89,7 @@ export function safeErrorDetail(status: number, body: string): SafeErrorDetail |
 
   const detail: SafeErrorDetail = pick(parsed, ["code", "message"] as const);
 
-  const rawErrors = (parsed as { errors?: unknown }).errors;
+  const rawErrors = status === 400 ? (parsed as { errors?: unknown }).errors : undefined;
   if (Array.isArray(rawErrors)) {
     const errors = rawErrors
       .slice(0, MAX_DETAIL_ERRORS)

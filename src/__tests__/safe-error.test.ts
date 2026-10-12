@@ -89,9 +89,50 @@ describe("safeErrorDetail", () => {
     expect(JSON.stringify(detail)).not.toContain("INTERNAL-STACK-TRACE");
   });
 
-  it.each([401, 403, 404, 409, 429, 500, 502])("gives no detail for a %i", (status) => {
+  it.each([401, 404, 409, 429, 500, 502])("gives no detail for a %i", (status) => {
     const body = JSON.stringify({ code: "Whatever", message: SECRET_BODY_TEXT });
     expect(safeErrorDetail(status, body)).toBeUndefined();
+  });
+
+  it("keeps code and message of a 403, so the missing permission is named", () => {
+    const body = JSON.stringify({ code: "Forbidden", message: "Invoices Edit required" });
+    expect(safeErrorDetail(403, body)).toEqual({
+      code: "Forbidden",
+      message: "Invoices Edit required",
+    });
+  });
+
+  it("takes nothing else from a 403 body, not even the per-field errors a 400 keeps", () => {
+    const body = JSON.stringify({
+      code: "Forbidden",
+      message: "no access",
+      errors: [{ code: "x", message: "y", resource: "invoice", field: "status" }],
+      stackTrace: SECRET_BODY_TEXT,
+      innerException: { detail: SECRET_BODY_TEXT },
+    });
+
+    const detail = safeErrorDetail(403, body);
+
+    expect(detail).toEqual({ code: "Forbidden", message: "no access" });
+    expect(JSON.stringify(detail)).not.toContain("INTERNAL-STACK-TRACE");
+  });
+
+  it("cleans and caps the code and message of a 403 at 200 characters each", () => {
+    const body = JSON.stringify({ code: "c".repeat(5000), message: "line one\r\n" + "m".repeat(5000) });
+
+    const detail = safeErrorDetail(403, body);
+
+    expect(detail?.code).toHaveLength(MAX_DETAIL_STRING);
+    expect(detail?.message).toHaveLength(MAX_DETAIL_STRING);
+    expect(detail?.message?.startsWith("line one mmm")).toBe(true);
+  });
+
+  it.each([
+    ["HTML", "<html><body>" + SECRET_BODY_TEXT + "</body></html>"],
+    ["plain text", SECRET_BODY_TEXT],
+    ["a JSON array", JSON.stringify([{ message: SECRET_BODY_TEXT }])],
+  ])("gives no detail for a 403 whose body is %s", (_label, body) => {
+    expect(safeErrorDetail(403, body)).toBeUndefined();
   });
 
   it.each([
@@ -111,7 +152,7 @@ describe("safeErrorDetail", () => {
 
   it("cuts a long string to the size limit", () => {
     const detail = safeErrorDetail(400, JSON.stringify({ message: "x".repeat(5000) }));
-    expect(detail?.message).toHaveLength(MAX_DETAIL_STRING + 3);
+    expect(detail?.message).toHaveLength(MAX_DETAIL_STRING);
     expect(detail?.message?.endsWith("...")).toBe(true);
   });
 
@@ -225,6 +266,24 @@ describe("CwManageClient on a failed response", () => {
     expect(error.message).toContain('"field":"summary"');
     expect(error.message).not.toContain("INTERNAL-STACK-TRACE");
     expect(logged()).not.toContain("summary is required");
+  });
+
+  it("names the missing permission on a 403, and keeps the rest of the body out", async () => {
+    const body = JSON.stringify({
+      code: "Forbidden",
+      message: "Invoices Edit required",
+      stackTrace: SECRET_BODY_TEXT,
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(body, 403)));
+
+    const error = (await client().get("/finance/invoices/1").catch((err: unknown) => err)) as CwApiError;
+
+    expect(error.status).toBe(403);
+    expect(error.message).toMatch(
+      /returned 403 \(reference [0-9a-f-]{36}\): \{"code":"Forbidden","message":"Invoices Edit required"\}$/,
+    );
+    expect(error.message).not.toContain("INTERNAL-STACK-TRACE");
+    expect(logged()).not.toContain("Invoices Edit required");
   });
 
   it("still fails cleanly when the error body cannot be read", async () => {
