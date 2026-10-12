@@ -36,6 +36,7 @@ import { registerOpportunityTools } from "./tools/opportunities.js";
 import { registerFinanceProcurementTools } from "./tools/finance-procurement.js";
 import { registerTicketTaskTools } from "./tools/ticket-tasks.js";
 import { registerTicketMergeTools } from "./tools/ticket-merge.js";
+import { registerCompanyTypeTools } from "./tools/company-types.js";
 
 export type { CwManageConfig };
 
@@ -180,6 +181,7 @@ export function createMcpServer(configOverride?: CwManageConfig): McpServer {
   registerFinanceProcurementTools(server, client);
   registerTicketTaskTools(server, client);
   registerTicketMergeTools(server, client);
+  registerCompanyTypeTools(server, client);
 
   return server;
 }
