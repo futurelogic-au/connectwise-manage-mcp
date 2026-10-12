@@ -189,9 +189,9 @@ ConnectWise exposes additions only as children of a single agreement, with no cr
 
 ### Expenses
 - `cw_list_expense_types`: List expense types (inactive left out unless asked), with the ID the claim needs
-- `cw_list_charge_codes`: List charge codes, with the ID the claim needs
-- `cw_search_expense_entries`: Search the owner's own expense entries by date range and amount. The member is your own, from `CW_MANAGE_MEMBER_ID`; another member's ID is refused, and with the variable unset nothing is read
-- `cw_create_expense_entry`: Create one expense entry for the owner. `expenseTypeId` and `chargeCodeId` are required with no default, and `merchant` is required and written at the start of the notes. A duplicate check on date, amount and merchant runs first and a match is refused. Needs `confirm: true` and reads the entry back. There is no expense delete tool
+- `cw_list_charge_codes`: List charge codes, for the `chargeCodeId` on a claim
+- `cw_search_expense_entries`: Search the owner's own expense entries by date range and amount. Each row carries the entry's company. The member is your own, from `CW_MANAGE_MEMBER_ID`; another member's ID is refused, and with the variable unset nothing is read
+- `cw_create_expense_entry`: Create one expense entry for the owner. `expenseTypeId` is required with no default. Every claim needs a charge-to: pass exactly one of `chargeCodeId` and `companyId`, with no default (neither, or both, is refused). A company is sent as the entry's company reference. `merchant` is required and written at the start of the notes (merchant `Ampol` with notes `Petrol` is stored as `Ampol, Petrol`). A duplicate check on date, amount and merchant runs first and a match is refused. Needs `confirm: true` and reads the entry back. There is no expense delete tool
 - `cw_attach_document`: Attach a receipt (`.pdf`, `.png`, `.jpg`, `.jpeg`, at most 10 MiB) to one of the owner's expense entries through `POST /system/documents`. The file is read from disk under `CW_MANAGE_ATTACH_ROOT` and is never moved, renamed or filed. Needs `confirm: true`, skips a file already on the entry, and reads the entry's documents back
 
 ### Invoices

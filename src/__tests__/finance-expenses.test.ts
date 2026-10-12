@@ -76,6 +76,8 @@ interface World {
   exclusions: Record<string, Rec[]>;
   /** Make a created entry come back with a different amount. */
   alterAmount: boolean;
+  /** Make a created entry come back without its company. */
+  dropCompany: boolean;
 }
 
 function fakeConnectWise(initial: Partial<World> = {}) {
@@ -86,6 +88,7 @@ function fakeConnectWise(initial: Partial<World> = {}) {
     documents: [],
     exclusions: {},
     alterAmount: false,
+    dropCompany: false,
     ...initial,
   };
   const calls: Call[] = [];
@@ -129,6 +132,7 @@ function fakeConnectWise(initial: Partial<World> = {}) {
     if (reqPath === "/expense/entries" && method === "POST") {
       const record: Rec = { id: nextEntry++, status: "Open", ...(payload as Rec) };
       if (world.alterAmount) record.amount = (record.amount as number) + 1;
+      if (world.dropCompany) delete record.company;
       world.entries.push(record);
       return jsonResponse(record);
     }
@@ -392,6 +396,19 @@ describe("expense tools", () => {
       expect(cw.calls.some((c) => c.path === "/expense/entries")).toBe(false);
     });
 
+    it("returns the company on each lean row, so existing claims can be checked", async () => {
+      fakeConnectWise({
+        entries: [
+          { id: 4, date: "2026-10-05T00:00:00Z", amount: 12, member: { id: 20 }, company: { id: 250, name: "Future Logic HQ" } },
+          { id: 5, date: "2026-10-06T00:00:00Z", amount: 9, member: { id: 20 } },
+        ],
+      });
+      const result = await call("cw_search_expense_entries", {});
+      const rows = (body(result) as { entries: Rec[] }).entries;
+      expect(rows.find((r) => r.id === 4)).toMatchObject({ company: { id: 250, name: "Future Logic HQ" } });
+      expect(rows.find((r) => r.id === 5)).toMatchObject({ company: null });
+    });
+
     it("accepts the owner's own member id", async () => {
       fakeConnectWise({ entries });
       const result = await call("cw_search_expense_entries", { memberId: 20 });
@@ -489,7 +506,7 @@ describe("expense tools", () => {
       merchant: "BP Welshpool",
     };
 
-    it("requires the expense type and the charge code, with no default", async () => {
+    it("requires the expense type, with no default, and takes the charge code as optional", async () => {
       const tools = (
         await mcp<{ tools: { name: string; inputSchema: { required?: string[]; properties: Record<string, Rec> } }[] }>(
           "tools/list",
@@ -498,23 +515,127 @@ describe("expense tools", () => {
       ).result.tools;
       const tool = tools.find((t) => t.name === "cw_create_expense_entry")!;
       expect(tool.inputSchema.required).toEqual(
-        expect.arrayContaining(["expenseTypeId", "chargeCodeId", "amount", "date", "merchant"]),
+        expect.arrayContaining(["expenseTypeId", "amount", "date", "merchant"]),
       );
+      expect(tool.inputSchema.required).not.toContain("chargeCodeId");
       expect(tool.inputSchema.properties.expenseTypeId).not.toHaveProperty("default");
       expect(tool.inputSchema.properties.chargeCodeId).not.toHaveProperty("default");
       // There is no member parameter: the claim is always the owner's own.
       expect(tool.inputSchema.properties).not.toHaveProperty("memberId");
     });
 
-    it("refuses a call without the expense type or the charge code, with no request", async () => {
+    it("refuses a call without the expense type, with no request", async () => {
       const cw = fakeConnectWise();
       const { expenseTypeId: _a, ...noType } = claim;
-      const { chargeCodeId: _b, ...noCode } = claim;
-      for (const args of [noType, noCode]) {
-        const result = await call("cw_create_expense_entry", { ...args, confirm: true });
-        expect(result.isError).toBe(true);
-      }
+      const result = await call("cw_create_expense_entry", { ...noType, confirm: true });
+      expect(result.isError).toBe(true);
       expect(cw.fetchMock).not.toHaveBeenCalled();
+    });
+
+    describe("charge-to: a charge code or a company (D22 amended)", () => {
+      const { chargeCodeId: _code, ...base } = claim;
+      const withCompany = { ...base, companyId: 250 };
+
+      it("lists both as optional parameters with no default", async () => {
+        const tools = (
+          await mcp<{ tools: { name: string; inputSchema: { required?: string[]; properties: Record<string, Rec> } }[] }>(
+            "tools/list",
+            {},
+          )
+        ).result.tools;
+        const tool = tools.find((t) => t.name === "cw_create_expense_entry")!;
+        expect(tool.inputSchema.properties).toHaveProperty("chargeCodeId");
+        expect(tool.inputSchema.properties).toHaveProperty("companyId");
+        expect(tool.inputSchema.properties.companyId).not.toHaveProperty("default");
+        expect(tool.inputSchema.required).not.toContain("chargeCodeId");
+        expect(tool.inputSchema.required).not.toContain("companyId");
+      });
+
+      it("refuses a claim with neither, with no request, even when confirmed", async () => {
+        const cw = fakeConnectWise();
+        const result = await call("cw_create_expense_entry", { ...base, confirm: true });
+        expect(result.isError).toBe(true);
+        expect(String(body(result).message)).toMatch(/needs a charge-to.*exactly one of chargeCodeId and companyId/);
+        expect(cw.fetchMock).not.toHaveBeenCalled();
+      });
+
+      it("refuses a claim with both, with no request", async () => {
+        const cw = fakeConnectWise();
+        const result = await call("cw_create_expense_entry", { ...base, chargeCodeId: 12, companyId: 250, confirm: true });
+        expect(result.isError).toBe(true);
+        expect(String(body(result).message)).toMatch(/not both/);
+        expect(cw.fetchMock).not.toHaveBeenCalled();
+      });
+
+      it("sends the company as the entry's company reference, with no charge-to type", async () => {
+        const cw = fakeConnectWise();
+
+        const plan = await call("cw_create_expense_entry", withCompany);
+        const planned = (body(plan) as { planned: Rec }).planned;
+        expect(planned).toMatchObject({ company: { id: 250 } });
+        expect(planned).not.toHaveProperty("chargeToType");
+        expect(planned).not.toHaveProperty("chargeToId");
+
+        const made = await call("cw_create_expense_entry", { ...withCompany, confirm: true });
+        expect(made.isError).not.toBe(true);
+        const post = cw.calls.find((c) => c.method === "POST")!.body as Rec;
+        expect(post).toMatchObject({ member: { id: 20 }, type: { id: 3 }, amount: 80.5, company: { id: 250 } });
+        expect(post).not.toHaveProperty("chargeToType");
+        expect(post).not.toHaveProperty("chargeToId");
+      });
+
+      it("shows the company in the read back, and checks it", async () => {
+        fakeConnectWise();
+        const result = await call("cw_create_expense_entry", { ...withCompany, confirm: true });
+        expect(body(result)).toMatchObject({ saved: true, verified: true, entry: { company: { id: 250 } } });
+      });
+
+      it("reports a company the fresh read does not hold", async () => {
+        fakeConnectWise({ dropCompany: true });
+        const result = await call("cw_create_expense_entry", { ...withCompany, confirm: true });
+        expect(result.isError).toBe(true);
+        expect(body(result)).toMatchObject({ verified: false, mismatches: ["company"] });
+      });
+
+      it("sends the charge code as the charge-to, and no company, when a charge code is given", async () => {
+        const cw = fakeConnectWise();
+        const result = await call("cw_create_expense_entry", { ...claim, confirm: true });
+        const post = cw.calls.find((c) => c.method === "POST")!.body as Rec;
+        expect(post).toMatchObject({ chargeToType: "ChargeCode", chargeToId: 12 });
+        expect(post).not.toHaveProperty("company");
+        expect(body(result)).toMatchObject({ verified: true, entry: { chargeToId: 12, company: null } });
+      });
+
+      it("takes Do Not Bill and writes the notes as merchant, then the note", async () => {
+        const cw = fakeConnectWise();
+
+        const result = await call("cw_create_expense_entry", {
+          ...withCompany,
+          expenseTypeId: 7,
+          merchant: "Ampol",
+          notes: "Petrol",
+          billableOption: "DoNotBill",
+          confirm: true,
+        });
+
+        expect(body(result)).toMatchObject({ saved: true, verified: true, entry: { notes: "Ampol, Petrol" } });
+        expect(cw.calls.find((c) => c.method === "POST")!.body).toMatchObject({
+          type: { id: 7 },
+          billableOption: "DoNotBill",
+          notes: "Ampol, Petrol",
+        });
+      });
+
+      it("does not double the merchant when the note already names it", async () => {
+        const cw = fakeConnectWise();
+        await call("cw_create_expense_entry", {
+          ...withCompany,
+          merchant: "Ampol",
+          notes: "ampol, Petrol",
+          confirm: true,
+        });
+        expect(cw.calls.find((c) => c.method === "POST")!.body).toMatchObject({ notes: "ampol, Petrol" });
+      });
     });
 
     it("makes no write without confirm: true, and shows the duplicate check", async () => {
@@ -546,7 +667,7 @@ describe("expense tools", () => {
       expect(body(result)).toMatchObject({
         saved: true,
         verified: true,
-        entry: { id: 900, amount: 80.5, memberId: 20, chargeToId: 12, notes: "BP Welshpool: Fuel for the site visit" },
+        entry: { id: 900, amount: 80.5, memberId: 20, chargeToId: 12, notes: "BP Welshpool, Fuel for the site visit" },
       });
       const post = cw.calls.find((c) => c.method === "POST")!;
       expect(post.path).toBe("/expense/entries");
