@@ -194,7 +194,7 @@ function fakeConnectWise(initial: Partial<World> = {}) {
   });
 
   vi.stubGlobal("fetch", fetchMock);
-  return { calls, fetchMock, world };
+  return { calls, fetchMock, world, state_timeEntries: () => world.timeEntries };
 }
 
 const writes = (calls: Call[]) => calls.filter((c) => c.method !== "GET");
@@ -395,8 +395,31 @@ describe("cw_create_time_entry", () => {
     memberId: 20,
     timeStart: "2026-10-12T02:00:00Z",
     actualHours: 0.25,
+    confirm: true,
   };
   const openTicket = { 77: { id: 77, closedFlag: false } };
+
+  it("makes no write without confirm: true and returns the planned body", async () => {
+    const cw = fakeConnectWise({ serviceTickets: openTicket });
+
+    const { confirm: _confirm, ...unconfirmed } = entry;
+    const result = await call("cw_create_time_entry", { ...unconfirmed, billableOption: "NoCharge" });
+
+    expect(result.isError).toBe(true);
+    expect(writes(cw.calls)).toEqual([]);
+    expect(body(result)).toMatchObject({
+      saved: false,
+      planned: { chargeToType: "ServiceTicket", chargeToId: 77, billableOption: "NoCharge" },
+    });
+    expect(cw.state_timeEntries()).toEqual({});
+  });
+
+  it("reports a closed ticket before it asks for confirmation", async () => {
+    fakeConnectWise({ serviceTickets: { 77: { id: 77, closedFlag: true } } });
+    const { confirm: _confirm, ...unconfirmed } = entry;
+    const result = await call("cw_create_time_entry", unconfirmed);
+    expect(body(result)).toMatchObject({ reason: "ticket-closed" });
+  });
 
   it("sets billableOption at creation and reads the entry back", async () => {
     const cw = fakeConnectWise({ serviceTickets: openTicket });

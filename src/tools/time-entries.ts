@@ -45,7 +45,7 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
 
   server.tool(
     "cw_create_time_entry",
-    "Create a new time entry. billableOption sets how the time bills (Billable, DoNotBill, NoCharge or NoDefault) at creation, so no patch is needed afterwards. A ticket that is closed refuses new time: the tool reports that and does not reopen the ticket. An entry on a time period that is submitted or past is refused with \"time period not open\" unless the member's time sheet is passed as timeSheetId (the sheet's ID for that period). When billableOption or timeSheetId is set, the entry is read back and the response carries a verified block.",
+    "Create a new time entry. Requires confirm: true. Without it nothing is written and the planned body is returned. billableOption sets how the time bills (Billable, DoNotBill, NoCharge or NoDefault) at creation, so no patch is needed afterwards. A ticket that is closed refuses new time: the tool reports that and does not reopen the ticket. An entry on a time period that is submitted or past is refused with \"time period not open\" unless the member's time sheet is passed as timeSheetId (the sheet's ID for that period). When billableOption or timeSheetId is set, the entry is read back and the response carries a verified block.",
     {
       chargeToType: z.enum(["ServiceTicket", "ProjectTicket", "ChargeCode", "Activity"]).describe("What to charge the time to"),
       chargeToId: z.number().describe("ID of the ticket, charge code, or activity"),
@@ -67,6 +67,10 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
         .positive()
         .optional()
         .describe("Time sheet ID for the period the entry falls in. Needed to add time to a submitted or past period"),
+      confirm: z
+        .boolean()
+        .optional()
+        .describe("Must be true for the entry to be created. Omitted or false makes no write"),
     },
     async ({
       chargeToType,
@@ -81,6 +85,7 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
       workRoleId,
       billableOption,
       timeSheetId,
+      confirm,
     }) => {
       const body: Record<string, unknown> = {
         chargeToType,
@@ -129,6 +134,26 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
           }
           throw err;
         }
+      }
+
+      if (confirm !== true) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  saved: false,
+                  message: "No write was made. Pass confirm: true to create this time entry.",
+                  planned: body,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: true,
+        };
       }
 
       let result: Record<string, unknown>;
