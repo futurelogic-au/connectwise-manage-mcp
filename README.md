@@ -42,6 +42,22 @@ For deploying to **Azure Container Apps** with Entra ID OAuth 2.1, see [AZURE_AC
 | `MCP_TRANSPORT` | No | `stdio` (default) or `http` |
 | `MCP_HTTP_PORT` | No | HTTP port (default: `8080`) |
 | `AUTH_MODE` | No | `env` (default) or `gateway` for header-based auth |
+| `CW_MANAGE_MEMBER_ID` | For expense tools | Your own ConnectWise member id. Set per person, in that person's own connector entry. Unset, the expense tools refuse and read and write nothing. See "Per-person settings for expense claims" below |
+
+### Per-person settings for expense claims
+
+The expense tools are limited to your own claims. Set these in the `env` block of your own connector entry, on your own machine:
+
+```json
+"CW_MANAGE_MEMBER_ID": "your-member-id"
+```
+
+- **`CW_MANAGE_MEMBER_ID` is per person.** It is your own ConnectWise member id, a whole number above zero. Every expense search, claim and receipt uses it as the member. It is never shared and never read from a request.
+- **Unset, the expense tools refuse.** `cw_search_expense_entries`, `cw_create_expense_entry` and `cw_attach_document` return a message that names the variable, and read and write nothing. A `memberId` argument that differs from it is refused.
+- **The connector does not look the member up.** `GET /system/myAccount` answers 404 on ConnectWise v2025.1, so the id comes from this variable and nowhere else.
+- **Use it on a per-person install.** One process with one member id serves one person. Do not rely on the expense tools in a shared gateway deployment, where one process serves many callers.
+- `CW_MANAGE_ATTACH_ROOT`, in the table above, is set the same way, per person in each connector entry.
+- Restart the client after you set either. The connector reads its environment when it starts.
 
 ### API Base URL (`CW_MANAGE_URL`)
 
@@ -174,7 +190,7 @@ ConnectWise exposes additions only as children of a single agreement, with no cr
 ### Expenses
 - `cw_list_expense_types`: List expense types (inactive left out unless asked), with the ID the claim needs
 - `cw_list_charge_codes`: List charge codes, with the ID the claim needs
-- `cw_search_expense_entries`: Search the owner's own expense entries by date range and amount. The member is the one the connector's keys belong to (`/system/myAccount`); another member's ID is refused
+- `cw_search_expense_entries`: Search the owner's own expense entries by date range and amount. The member is your own, from `CW_MANAGE_MEMBER_ID`; another member's ID is refused, and with the variable unset nothing is read
 - `cw_create_expense_entry`: Create one expense entry for the owner. `expenseTypeId` and `chargeCodeId` are required with no default, and `merchant` is required and written at the start of the notes. A duplicate check on date, amount and merchant runs first and a match is refused. Needs `confirm: true` and reads the entry back. There is no expense delete tool
 - `cw_attach_document`: Attach a receipt (`.pdf`, `.png`, `.jpg`, `.jpeg`, at most 10 MiB) to one of the owner's expense entries through `POST /system/documents`. The file is read from disk under `CW_MANAGE_ATTACH_ROOT` and is never moved, renamed or filed. Needs `confirm: true`, skips a file already on the entry, and reads the entry's documents back
 
