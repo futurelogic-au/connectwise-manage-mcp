@@ -26,6 +26,7 @@
  */
 import { Agent, fetch as undiciFetch } from "undici";
 import { assertSafeGatewayUrl } from "./url-guard.js";
+import type { MultipartBody } from "./multipart.js";
 import {
   formatErrorDetail,
   logRequestFailure,
@@ -164,6 +165,8 @@ export class CwManageClient {
     options?: {
       body?: unknown;
       params?: Record<string, string | number | undefined>;
+      /** A multipart body, sent as is with its own Content-Type. Used for document upload. */
+      multipart?: MultipartBody;
     },
   ): Promise<T> {
     // Re-checked per request so a hostname re-pointed after the last call is caught.
@@ -189,7 +192,13 @@ export class CwManageClient {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     };
 
-    if (options?.body !== undefined) {
+    if (options?.multipart) {
+      fetchOptions.headers = {
+        ...this.defaultHeaders(),
+        "Content-Type": options.multipart.contentType,
+      };
+      fetchOptions.body = options.multipart.body as unknown as RequestInit["body"];
+    } else if (options?.body !== undefined) {
       fetchOptions.body = JSON.stringify(options.body);
     }
 
@@ -245,6 +254,11 @@ export class CwManageClient {
   /** POST helper */
   async post<T = unknown>(path: string, body: unknown): Promise<T> {
     return this.request<T>("POST", path, { body });
+  }
+
+  /** Multipart POST helper, for the document upload. */
+  async postMultipart<T = unknown>(path: string, multipart: MultipartBody): Promise<T> {
+    return this.request<T>("POST", path, { multipart });
   }
 
   /** PATCH helper */
