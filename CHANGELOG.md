@@ -52,6 +52,7 @@
 
 ### Documentation
 
+- State in the README that `CW_MANAGE_ATTACH_ROOT` is set per person, in each person's own connector entry, and that `cw_attach_document` refuses and reads nothing while it is unset.
 - Clarify the "Deploy to Cloudflare Workers" / "Deploy to DigitalOcean" one-click flow: this server depends only on public npm packages, so the cloud builders install without any registry token. Installing the published package from GitHub Packages does require a GitHub PAT with `read:packages` (`export NODE_AUTH_TOKEN=$(gh auth token)`).
 
 # [1.4.0](https://github.com/wyre-technology/connectwise-manage-mcp/compare/v1.3.0...v1.4.0) (2026-04-03)

@@ -38,7 +38,7 @@ For deploying to **Azure Container Apps** with Entra ID OAuth 2.1, see [AZURE_AC
 | `CW_MANAGE_CLIENT_ID` | Yes | Client ID from [ConnectWise Developer Portal](https://developer.connectwise.com/) |
 | `CW_MANAGE_URL` | No | API base URL (see below) |
 | `CW_MANAGE_REJECT_UNAUTHORIZED` | No | Set to `false` for self-signed certs (default: `true`) |
-| `CW_MANAGE_ATTACH_ROOT` | No | Folder `cw_attach_document` may read a receipt from. Unset means no file is attached. Files outside it, including through a link, are refused |
+| `CW_MANAGE_ATTACH_ROOT` | No | Folder `cw_attach_document` may read a receipt from. Set per person, in that person's own connector entry. Unset, the tool refuses and reads nothing. A file outside the folder, including one reached through a link, is refused. See "Receipt folder" below |
 | `MCP_TRANSPORT` | No | `stdio` (default) or `http` |
 | `MCP_HTTP_PORT` | No | HTTP port (default: `8080`) |
 | `AUTH_MODE` | No | `env` (default) or `gateway` for header-based auth |
@@ -270,6 +270,19 @@ For a self-hosted instance:
   }
 }
 ```
+
+#### Receipt folder
+
+`cw_attach_document` uploads a receipt to one of your own expense entries. It reads the file from disk, so it needs to be told where receipts live. Add `CW_MANAGE_ATTACH_ROOT` to the `env` block of your own connector entry, set to one folder of receipts:
+
+```json
+"CW_MANAGE_ATTACH_ROOT": "C:\\Users\\you\\Documents\\Expense Claims"
+```
+
+- **It is per person.** Each person sets it in their own connector entry, on their own machine, to their own folder. It is never shared, and it is never read from a request.
+- **Unset, the tool refuses.** With no `CW_MANAGE_ATTACH_ROOT` the attach says so and reads nothing, so a receipt is never attached by accident.
+- **Only that folder is read.** A file outside it, including one reached through a link, is refused. The file is read and never moved, renamed or changed.
+- Restart the client after you set it. The connector reads its environment when it starts.
 
 ### With Docker
 
