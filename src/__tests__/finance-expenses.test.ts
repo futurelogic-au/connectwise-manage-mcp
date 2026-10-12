@@ -489,7 +489,7 @@ describe("expense tools", () => {
       merchant: "BP Welshpool",
     };
 
-    it("requires the expense type and the charge code, with no default", async () => {
+    it("requires the expense type, with no default, and takes the charge code as optional", async () => {
       const tools = (
         await mcp<{ tools: { name: string; inputSchema: { required?: string[]; properties: Record<string, Rec> } }[] }>(
           "tools/list",
@@ -498,23 +498,84 @@ describe("expense tools", () => {
       ).result.tools;
       const tool = tools.find((t) => t.name === "cw_create_expense_entry")!;
       expect(tool.inputSchema.required).toEqual(
-        expect.arrayContaining(["expenseTypeId", "chargeCodeId", "amount", "date", "merchant"]),
+        expect.arrayContaining(["expenseTypeId", "amount", "date", "merchant"]),
       );
+      expect(tool.inputSchema.required).not.toContain("chargeCodeId");
       expect(tool.inputSchema.properties.expenseTypeId).not.toHaveProperty("default");
       expect(tool.inputSchema.properties.chargeCodeId).not.toHaveProperty("default");
       // There is no member parameter: the claim is always the owner's own.
       expect(tool.inputSchema.properties).not.toHaveProperty("memberId");
     });
 
-    it("refuses a call without the expense type or the charge code, with no request", async () => {
+    it("refuses a call without the expense type, with no request", async () => {
       const cw = fakeConnectWise();
       const { expenseTypeId: _a, ...noType } = claim;
-      const { chargeCodeId: _b, ...noCode } = claim;
-      for (const args of [noType, noCode]) {
-        const result = await call("cw_create_expense_entry", { ...args, confirm: true });
-        expect(result.isError).toBe(true);
-      }
+      const result = await call("cw_create_expense_entry", { ...noType, confirm: true });
+      expect(result.isError).toBe(true);
       expect(cw.fetchMock).not.toHaveBeenCalled();
+    });
+
+    describe("without a charge code (D22)", () => {
+      const { chargeCodeId: _omitted, ...noCharge } = claim;
+
+      it("sends no charge-to at all, in the plan or in the write", async () => {
+        const cw = fakeConnectWise();
+
+        const plan = await call("cw_create_expense_entry", noCharge);
+        const planned = (body(plan) as { planned: Rec }).planned;
+        expect(planned).not.toHaveProperty("chargeToType");
+        expect(planned).not.toHaveProperty("chargeToId");
+
+        const made = await call("cw_create_expense_entry", { ...noCharge, confirm: true });
+        expect(made.isError).not.toBe(true);
+        const post = cw.calls.find((c) => c.method === "POST")!.body as Rec;
+        expect(post).not.toHaveProperty("chargeToType");
+        expect(post).not.toHaveProperty("chargeToId");
+        expect(post).toMatchObject({ member: { id: 20 }, type: { id: 3 }, amount: 80.5 });
+      });
+
+      it("verifies the entry without checking a charge code", async () => {
+        fakeConnectWise();
+        const result = await call("cw_create_expense_entry", { ...noCharge, confirm: true });
+        expect(body(result)).toMatchObject({ saved: true, verified: true, entry: { chargeToId: null } });
+      });
+
+      it("still checks the charge code when one is given", async () => {
+        fakeConnectWise();
+        const result = await call("cw_create_expense_entry", { ...claim, confirm: true });
+        expect(body(result)).toMatchObject({ verified: true, entry: { chargeToId: 12 } });
+      });
+
+      it("takes Do Not Bill and writes the notes as merchant, then the note", async () => {
+        const cw = fakeConnectWise();
+
+        const result = await call("cw_create_expense_entry", {
+          ...noCharge,
+          expenseTypeId: 7,
+          merchant: "Ampol",
+          notes: "Petrol",
+          billableOption: "DoNotBill",
+          confirm: true,
+        });
+
+        expect(body(result)).toMatchObject({ saved: true, verified: true, entry: { notes: "Ampol, Petrol" } });
+        expect(cw.calls.find((c) => c.method === "POST")!.body).toMatchObject({
+          type: { id: 7 },
+          billableOption: "DoNotBill",
+          notes: "Ampol, Petrol",
+        });
+      });
+
+      it("does not double the merchant when the note already names it", async () => {
+        const cw = fakeConnectWise();
+        await call("cw_create_expense_entry", {
+          ...noCharge,
+          merchant: "Ampol",
+          notes: "ampol, Petrol",
+          confirm: true,
+        });
+        expect(cw.calls.find((c) => c.method === "POST")!.body).toMatchObject({ notes: "ampol, Petrol" });
+      });
     });
 
     it("makes no write without confirm: true, and shows the duplicate check", async () => {
@@ -546,7 +607,7 @@ describe("expense tools", () => {
       expect(body(result)).toMatchObject({
         saved: true,
         verified: true,
-        entry: { id: 900, amount: 80.5, memberId: 20, chargeToId: 12, notes: "BP Welshpool: Fuel for the site visit" },
+        entry: { id: 900, amount: 80.5, memberId: 20, chargeToId: 12, notes: "BP Welshpool, Fuel for the site visit" },
       });
       const post = cw.calls.find((c) => c.method === "POST")!;
       expect(post.path).toBe("/expense/entries");
