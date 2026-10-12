@@ -7,8 +7,10 @@ import { fetchAllPages } from "./paging.js";
 /**
  * Expense claims and receipts (rulings D22 to D24).
  *
- * - Own claims only (D23). The member is never a free choice: it is read from
- *   /system/myAccount, the member whose keys the connector runs on.
+ * - Own claims only (D23). The member is never a free choice: it is the
+ *   member id in CW_MANAGE_MEMBER_ID, set per person in that person's own
+ *   connector entry. Unset, the expense tools refuse. (GET /system/myAccount
+ *   answers 404 on ConnectWise v2025.1, so it is not used anywhere.)
  * - Expense type and charge code are required parameters, with no default
  *   (D22 is proposed by the owner's session, then ruled).
  * - Create needs confirm: true, and a duplicate check on date, amount and
@@ -95,19 +97,28 @@ function addDays(date: string, days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-/** The member the connector's keys belong to. Throws a plain message when it cannot be read. */
-async function ownMemberId(client: CwManageClient): Promise<number> {
-  const account = await client.get<Record<string, unknown> | Array<Record<string, unknown>>>(
-    "/system/myAccount",
-  );
-  const record = Array.isArray(account) ? account[0] : account;
-  const id = record?.id;
-  if (typeof id !== "number") {
-    throw new Error(
-      "The connector's own member could not be read from /system/myAccount, so claims cannot be limited to the owner's own (D23). Nothing was changed.",
-    );
+/** The environment variable that names the owner's own ConnectWise member id. */
+export const MEMBER_ID_VARIABLE = "CW_MANAGE_MEMBER_ID";
+
+/**
+ * The owner's own member id, from CW_MANAGE_MEMBER_ID. Returns a plain message,
+ * never a throw, when it is unset or not a whole number above zero, so a tool
+ * can refuse with it and read and write nothing.
+ */
+export function ownMemberId(): { id: number } | { message: string } {
+  const raw = typeof process !== "undefined" ? process.env[MEMBER_ID_VARIABLE] : undefined;
+  const value = raw?.trim();
+  if (!value) {
+    return {
+      message: `The expense tools need ${MEMBER_ID_VARIABLE}, the owner's own ConnectWise member id, set in the connector entry. It is not set, so nothing was read or changed (D23).`,
+    };
   }
-  return id;
+  if (!/^[1-9]\d*$/.test(value)) {
+    return {
+      message: `${MEMBER_ID_VARIABLE} must be a whole number above zero, the owner's own ConnectWise member id. Nothing was read or changed (D23).`,
+    };
+  }
+  return { id: Number(value) };
 }
 
 export interface DuplicateCheck {
@@ -180,7 +191,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
 
   server.tool(
     "cw_search_expense_entries",
-    "Search the owner's own expense entries (GET /expense/entries). Own claims only: the member is the one the connector's keys belong to, and a different memberId is refused. Filter by dateFrom and dateTo (YYYY-MM-DD) and amount. Each row is lean: id, date, amount, type, notes, status, chargeToType, chargeToId, billableOption, expenseReportId and memberId. Read-only.",
+    "Search the owner's own expense entries (GET /expense/entries). Own claims only: the member is the owner's member id from the CW_MANAGE_MEMBER_ID environment variable, a different memberId is refused, and with the variable unset nothing is read. Filter by dateFrom and dateTo (YYYY-MM-DD) and amount. Each row is lean: id, date, amount, type, notes, status, chargeToType, chargeToId, billableOption, expenseReportId and memberId. Read-only.",
     {
       memberId: z
         .number()
@@ -196,10 +207,12 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
     },
     READ_ONLY,
     async ({ memberId, dateFrom, dateTo, amount, page, pageSize }) => {
-      const own = await ownMemberId(client);
+      const member = ownMemberId();
+      if ("message" in member) return refused(member.message);
+      const own = member.id;
       if (memberId !== undefined && memberId !== own) {
         return refused(
-          `Expense claims are limited to the owner's own (D23). Member ${memberId} is not the member this connector runs as. Nothing was read.`,
+          `Expense claims are limited to the owner's own (D23). Member ${memberId} is not the member in ${MEMBER_ID_VARIABLE}. Nothing was read.`,
         );
       }
       const parts = [`member/id = ${own}`];
@@ -220,7 +233,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
 
   server.tool(
     "cw_create_expense_entry",
-    "Create one expense entry for the owner (POST /expense/entries). Own claims only. expenseTypeId and chargeCodeId are required and have no default: read them with cw_list_expense_types and cw_list_charge_codes. The merchant is required and is written at the start of the notes, because an expense entry has no merchant field. A duplicate check runs first on the owner's entries for the same date, same amount and a note naming the same merchant: a match is refused and nothing is written. Requires confirm: true. Without it nothing is written and the plan, with the duplicate check, is returned. After the write the entry is read back. There is no delete tool: a claim made in error is removed by hand in ConnectWise.",
+    "Create one expense entry for the owner (POST /expense/entries). Own claims only: the member is the id in CW_MANAGE_MEMBER_ID, and with it unset nothing is written. expenseTypeId and chargeCodeId are required and have no default: read them with cw_list_expense_types and cw_list_charge_codes. The merchant is required and is written at the start of the notes, because an expense entry has no merchant field. A duplicate check runs first on the owner's entries for the same date, same amount and a note naming the same merchant: a match is refused and nothing is written. Requires confirm: true. Without it nothing is written and the plan, with the duplicate check, is returned. After the write the entry is read back. There is no delete tool: a claim made in error is removed by hand in ConnectWise.",
     {
       expenseTypeId: z.number().int().positive().describe("Expense type ID, from cw_list_expense_types. Required, no default"),
       chargeCodeId: z.number().int().positive().describe("Charge code ID, from cw_list_charge_codes. Required, no default"),
@@ -250,7 +263,9 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
       billableOption,
       confirm,
     }) => {
-      const own = await ownMemberId(client);
+      const member = ownMemberId();
+      if ("message" in member) return refused(member.message);
+      const own = member.id;
 
       const noteText =
         notes && notes.toLowerCase().includes(merchant.toLowerCase()) ? notes : notes ? `${merchant}: ${notes}` : merchant;
@@ -336,7 +351,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
 
   server.tool(
     "cw_attach_document",
-    `Attach a receipt to one of the owner's expense entries (POST /system/documents, multipart). Own claims only: the entry must belong to the member the connector runs as. The file is read from disk and never moved, renamed or filed. It must be a .pdf, .png, .jpg or .jpeg of at most ${MAX_RECEIPT_BYTES / (1024 * 1024)} MiB, and it must sit under the folder named in the CW_MANAGE_ATTACH_ROOT environment variable. Without that variable nothing is attached. A file already on the entry with the same name and size is not attached twice. Requires confirm: true. Without it nothing is written and the file's name, size and SHA-256 are returned. After the upload the entry's documents are read back.`,
+    `Attach a receipt to one of the owner's expense entries (POST /system/documents, multipart). Own claims only: the entry must belong to the member id in CW_MANAGE_MEMBER_ID. The file is read from disk and never moved, renamed or filed. It must be a .pdf, .png, .jpg or .jpeg of at most ${MAX_RECEIPT_BYTES / (1024 * 1024)} MiB, and it must sit under the folder named in the CW_MANAGE_ATTACH_ROOT environment variable. Without that variable nothing is attached. A file already on the entry with the same name and size is not attached twice. Requires confirm: true. Without it nothing is written and the file's name, size and SHA-256 are returned. After the upload the entry's documents are read back.`,
     {
       recordType: z.enum(["Expense"]).describe("What the document attaches to. Only Expense is supported"),
       recordId: z.number().int().positive().describe("Expense entry ID, from cw_create_expense_entry"),
@@ -355,6 +370,10 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
           "Receipts can be attached only from a folder named in the CW_MANAGE_ATTACH_ROOT environment variable, and it is not set. Nothing was read.",
         );
       }
+
+      const member = ownMemberId();
+      if ("message" in member) return refused(member.message);
+      const own = member.id;
 
       let fs: typeof import("node:fs/promises");
       let nodePath: typeof import("node:path");
@@ -403,7 +422,6 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
       const fileName = nodePath.basename(realFile);
 
       // Own claims only.
-      const own = await ownMemberId(client);
       const entry = await client.get<ExpenseRecord>(`/expense/entries/${recordId}`);
       if (entry.member?.id !== own) {
         return refused(

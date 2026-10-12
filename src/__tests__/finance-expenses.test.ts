@@ -68,7 +68,6 @@ interface Call {
 }
 
 interface World {
-  memberId: number | null;
   expenseTypes: Rec[];
   chargeCodes: Rec[];
   entries: Rec[];
@@ -81,7 +80,6 @@ interface World {
 
 function fakeConnectWise(initial: Partial<World> = {}) {
   const world: World = {
-    memberId: 20,
     expenseTypes: [],
     chargeCodes: [],
     entries: [],
@@ -106,10 +104,9 @@ function fakeConnectWise(initial: Partial<World> = {}) {
     calls.push({ method, path: reqPath, query: parsed.searchParams, body: payload, contentType });
     let m: RegExpMatchArray | null;
 
+    // ConnectWise v2025.1 answers 404 here. No tool may depend on it.
     if (reqPath === "/system/myAccount") {
-      return world.memberId === null
-        ? jsonResponse({ code: "NotFound", message: "Not found" }, 404)
-        : jsonResponse({ id: world.memberId, identifier: "SJenner" });
+      return jsonResponse({ code: "NotFound", message: "Not found" }, 404);
     }
     if (reqPath === "/expense/types") return jsonResponse(world.expenseTypes);
     if (reqPath === "/time/chargeCodes") return jsonResponse(world.chargeCodes);
@@ -340,6 +337,10 @@ describe("agreement exclusions", () => {
 });
 
 describe("expense tools", () => {
+  beforeEach(() => {
+    vi.stubEnv("CW_MANAGE_MEMBER_ID", "20");
+  });
+
   const types = [
     { id: 3, name: "Fuel", mileageFlag: false, billExpenses: "NoCharge", inactiveFlag: false },
     { id: 4, name: "Old type", inactiveFlag: true },
@@ -398,10 +399,84 @@ describe("expense tools", () => {
       expect(body(result).count).toBe(2);
     });
 
-    it("stops when the connector's own member cannot be read", async () => {
-      fakeConnectWise({ entries, memberId: null });
-      const result = await mcp("tools/call", { name: "cw_search_expense_entries", arguments: {} });
-      expect(JSON.stringify(result)).toMatch(/404/);
+    it("refuses a member id that differs from CW_MANAGE_MEMBER_ID, without reading", async () => {
+      vi.stubEnv("CW_MANAGE_MEMBER_ID", "20");
+      const cw = fakeConnectWise({ entries });
+      const result = await call("cw_search_expense_entries", { memberId: 21 });
+      expect(result.isError).toBe(true);
+      expect(String(body(result).message)).toMatch(/not the member in CW_MANAGE_MEMBER_ID/);
+      expect(cw.fetchMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("CW_MANAGE_MEMBER_ID", () => {
+    const claim = {
+      expenseTypeId: 3,
+      chargeCodeId: 12,
+      amount: 80.5,
+      date: "2026-10-05",
+      merchant: "BP Welshpool",
+      confirm: true,
+    };
+
+    it.each([
+      ["unset", ""],
+      ["not a number", "twenty"],
+      ["zero", "0"],
+      ["negative", "-3"],
+      ["a number with text after it", "20x"],
+    ])("refuses all three expense tools when it is %s, and makes no request", async (_label, value) => {
+      vi.stubEnv("CW_MANAGE_MEMBER_ID", value);
+      const cw = fakeConnectWise({ entries: [{ id: 900, member: { id: 20 } }] });
+      const dir = await mkdtemp(path.join(tmpdir(), "cw-receipts-"));
+      try {
+        vi.stubEnv("CW_MANAGE_ATTACH_ROOT", dir);
+        const file = path.join(dir, "r.pdf");
+        await writeFile(file, Buffer.from("%PDF-1.4"));
+
+        const search = await call("cw_search_expense_entries", {});
+        const create = await call("cw_create_expense_entry", claim);
+        const attach = await call("cw_attach_document", {
+          recordType: "Expense",
+          recordId: 900,
+          filePath: file,
+          confirm: true,
+        });
+
+        for (const result of [search, create, attach]) {
+          expect(result.isError).toBe(true);
+          expect(String(body(result).message)).toContain("CW_MANAGE_MEMBER_ID");
+        }
+        expect(cw.fetchMock).not.toHaveBeenCalled();
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("names the variable and says nothing was read or changed when it is unset", async () => {
+      vi.stubEnv("CW_MANAGE_MEMBER_ID", "");
+      fakeConnectWise();
+      const result = await call("cw_search_expense_entries", {});
+      expect(String(body(result).message)).toMatch(
+        /need CW_MANAGE_MEMBER_ID.*not set, so nothing was read or changed/,
+      );
+    });
+
+    it("never calls /system/myAccount, which answers 404 on this ConnectWise", async () => {
+      const cw = fakeConnectWise({ entries: [] });
+      await call("cw_search_expense_entries", {});
+      await call("cw_create_expense_entry", claim);
+      expect(cw.calls.some((c) => c.path.toLowerCase() === "/system/myaccount")).toBe(false);
+      expect(cw.calls.length).toBeGreaterThan(0);
+    });
+
+    it("uses the member id in the variable for the claim", async () => {
+      vi.stubEnv("CW_MANAGE_MEMBER_ID", "31");
+      const cw = fakeConnectWise();
+      await call("cw_create_expense_entry", claim);
+      expect(cw.calls.find((c) => c.method === "POST")!.body).toMatchObject({ member: { id: 31 } });
+      const search = cw.calls.find((c) => c.path === "/expense/entries" && c.method === "GET")!;
+      expect(search.query.get("conditions")).toContain("member/id = 31");
     });
   });
 
@@ -683,6 +758,7 @@ describe("a stray empty directory is not a receipt", () => {
     const root = await mkdtemp(path.join(tmpdir(), "cw-receipts-"));
     try {
       vi.stubEnv("CW_MANAGE_ATTACH_ROOT", root);
+      vi.stubEnv("CW_MANAGE_MEMBER_ID", "20");
       const dir = path.join(root, "folder.pdf");
       await mkdir(dir);
       const cw = fakeConnectWise({ entries: [{ id: 900, member: { id: 20 } }] });
