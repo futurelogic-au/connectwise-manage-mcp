@@ -32,7 +32,7 @@ connector entry. Repoint and restart every client in this table, not one.
 | Machine | Client | Connector entry points at | Status |
 |---|---|---|---|
 | Stephan | Claude Desktop (`claude.exe`) | Release build | Verified 12/10/2026 07:34 at `eba6995`. `cw_test_connection` passed and CW ticket 904995 read |
-| Stephan | Codex (`codex.exe`, under the ChatGPT app) | Dev repo `dist`, as seen 11/10/2026 16:21 | Repoint not yet verified |
+| Stephan | Codex (`codex.exe`, under the ChatGPT app) | Release build | Process check 12/10/2026: runs the release build. `cw_test_connection` from Codex not yet recorded |
 | Nathan | Not yet recorded | Not yet recorded | Not yet on the release path |
 
 Add a row when a new client starts the connector. To find clients, list the `node.exe`
