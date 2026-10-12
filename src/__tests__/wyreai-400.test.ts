@@ -54,7 +54,10 @@ describe("ticket note email payload (A1)", () => {
     expect(buildTicketNoteBody({ text: "hello" })).toEqual({ text: "hello" });
   });
 
-  it("forwards email flags only when set, and turns on processNotifications for a true flag", () => {
+  // This ConnectWise version refuses recipient fields on a ServiceNote with 400
+  // "Could not find member ... on object of type 'ServiceNote'". They are mapped
+  // to the ticket's automaticEmail* fields instead (see ticket-responses.test.ts).
+  it("keeps the recipient fields off the body and turns on processNotifications for a true flag", () => {
     expect(
       buildTicketNoteBody({
         text: "question for the client",
@@ -65,8 +68,6 @@ describe("ticket note email payload (A1)", () => {
     ).toEqual({
       text: "question for the client",
       detailDescriptionFlag: true,
-      emailContactFlag: true,
-      emailCc: "billing@example.com",
       processNotifications: true,
     });
   });
@@ -80,10 +81,7 @@ describe("ticket note email payload (A1)", () => {
       emailCcFlag: false,
       emailCc: "nobody@example.com",
     });
-    expect(body.emailContactFlag).toBe(false);
-    expect(body.emailResourceFlag).toBe(false);
-    expect(body.emailCcFlag).toBe(false);
-    expect(body.processNotifications).toBeUndefined();
+    expect(body).toEqual({ text: "internal", internalAnalysisFlag: true });
   });
 
   it("lets an explicit processNotifications false suppress delivery", () => {
@@ -96,15 +94,13 @@ describe("ticket note email payload (A1)", () => {
     ).toBe(false);
   });
 
-  it("emails CC only when emailCcFlag is true", () => {
+  it("asks for notifications on a true CC flag, without sending the CC fields", () => {
     const body = buildTicketNoteBody({
       text: "copy",
       emailCcFlag: true,
       emailCc: "a@example.com;b@example.com",
     });
-    expect(body.emailCcFlag).toBe(true);
-    expect(body.emailCc).toBe("a@example.com;b@example.com");
-    expect(body.processNotifications).toBe(true);
+    expect(body).toEqual({ text: "copy", processNotifications: true });
   });
 });
 
@@ -248,7 +244,7 @@ describe("WYREAI-400 tool wiring", () => {
     });
   });
 
-  it("posts note email flags and returns visibility that matches the stored internal note", async () => {
+  it("posts an internal note with no recipient fields and returns visibility that matches the stored note", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       fakeResponse({
         id: 5,
@@ -277,7 +273,6 @@ describe("WYREAI-400 tool wiring", () => {
     expect(JSON.parse(init.body)).toEqual({
       text: "please confirm",
       internalAnalysisFlag: true,
-      emailContactFlag: false,
     });
     const echoed = JSON.parse(toolText(body)) as { internalFlag: boolean; externalFlag: boolean };
     expect(echoed.internalFlag).toBe(true);
