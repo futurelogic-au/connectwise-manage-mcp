@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CwManageClient } from "../api-client.js";
+import { COMPANY_TYPE_PATCH_ERROR, companyPatchTouchesTypes } from "./company-types.js";
 
 export function registerCompanyTools(server: McpServer, client: CwManageClient) {
   server.tool(
@@ -71,7 +72,7 @@ export function registerCompanyTools(server: McpServer, client: CwManageClient) 
 
   server.tool(
     "cw_update_company",
-    "Update an existing company using JSON Patch operations.",
+    "Update an existing company using JSON Patch operations. It cannot change the company's types: those are a child collection, so a patch on types or typeIds is refused. Use cw_add_company_type_association and cw_remove_company_type_association.",
     {
       id: z.number().describe("Company ID"),
       operations: z
@@ -85,6 +86,12 @@ export function registerCompanyTools(server: McpServer, client: CwManageClient) 
         .describe("Array of JSON Patch operations"),
     },
     async ({ id, operations }) => {
+      if (operations.some((operation) => companyPatchTouchesTypes(operation.path))) {
+        return {
+          content: [{ type: "text", text: COMPANY_TYPE_PATCH_ERROR }],
+          isError: true,
+        };
+      }
       const result = await client.patch(`/company/companies/${id}`, operations);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     },

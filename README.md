@@ -95,7 +95,11 @@ needed.
 - `cw_search_companies` — Search companies
 - `cw_get_company` — Get a company by ID
 - `cw_create_company` — Create a new company
-- `cw_update_company` — Update a company (JSON Patch)
+- `cw_update_company`: Update a company (JSON Patch). It cannot change the company's types; a patch on `types` or `typeIds` is refused
+- `cw_list_company_types`: List the company types ConnectWise holds, so a type name for the add is read, not guessed
+- `cw_list_company_type_associations`: List the types a company holds (`GET /company/companies/{id}/typeAssociations`), with the association ID of each
+- `cw_add_company_type_association`: Add a type by `typeId` or `typeName`. Needs `confirm: true`, skips a type the company already holds, and reads the types back
+- `cw_remove_company_type_association`: Remove a type by `associationId`, `typeId` or `typeName`. Needs `confirm: true`, lists first, deletes only a matching association, and reads the types back
 
 ### Contacts
 - `cw_search_contacts` — Search contacts. Filter contact type with `typeName`, `typeId`, or `childConditions` (for example `types/name = "Primary"`). `types` / `types/name` in `conditions` is invalid and returns 400 `ApiFindCondition` because type is a child collection; the tool moves those clauses to `childConditions`. Contacts have `firstName` and `lastName`, not `name`. String values use double quotes (`firstName = "Ada"`); single quotes are accepted and rewritten.
@@ -107,7 +111,9 @@ needed.
 ### Projects
 - `cw_search_projects` — Search projects
 - `cw_get_project` — Get a project by ID
-- `cw_create_project` — Create a new project
+- `cw_create_project`: Create a new project. `billingMethod` (`ActualRates`, `FixedFee`, `NotToExceed` or `OverrideRate`) and `agreementId` (an agreement ID, or `null` for none) are required and have no default. Needs `confirm: true`, and reads the project back
+- `cw_list_project_phases`: List the phases of a project, to find the `phaseId` a project ticket needs
+- `cw_create_project_ticket`: Create a ticket on a project phase (`POST /project/tickets`). Needs `confirm: true`, checks the phase belongs to the project, and reads the ticket back
 - `cw_search_project_tickets` — Search tickets under a project
 - `cw_get_project_ticket` — Get a specific project ticket by ID
 - `cw_get_project_ticket_notes` — Get all notes on a project ticket (including child ticket notes)
@@ -116,7 +122,7 @@ needed.
 ### Time Entries
 - `cw_search_time_entries` — Search time entries
 - `cw_get_time_entry` — Get a time entry by ID
-- `cw_create_time_entry` — Create a new time entry
+- `cw_create_time_entry`: Create a new time entry. `billableOption` (`Billable`, `DoNotBill`, `NoCharge` or `NoDefault`) is set at creation, so no patch is needed. `timeSheetId` adds time to a submitted or past period, which ConnectWise otherwise refuses with "time period not open". A closed ticket refuses new time: the tool says so and never reopens the ticket
 - `cw_update_time_entry` — Correct a time entry (JSON Patch on `PATCH /time/entries/{id}`). Use this to fix `actualHours` when a metered agreement rounds to 0.25.
 - `cw_delete_time_entry` — Delete a time entry (`DELETE /time/entries/{id}`). Manage rejects deletes of entries that are already billed.
 
