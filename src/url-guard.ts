@@ -7,6 +7,7 @@
  * since a self-hoster may legitimately point at a server on their own LAN.
  */
 import { lookup } from "node:dns/promises";
+import { isAllowedOrigin } from "./url-allowlist.js";
 
 export class UnsafeUrlError extends Error {}
 
@@ -24,6 +25,16 @@ export async function assertSafeGatewayUrl(input: string): Promise<void> {
   // A fragment or query would swallow the API path appended after the base.
   if (url.username || url.password || url.search || url.hash || input.includes("#") || input.includes("?")) {
     throw new UnsafeUrlError("ConnectWise URL must not contain credentials, a query string, or a fragment.");
+  }
+
+  // Only an administrator-approved origin, port included. Checked before the
+  // DNS lookup, so a host that is not approved is never even resolved.
+  if (!isAllowedOrigin(url)) {
+    throw new UnsafeUrlError(
+      url.port
+        ? "ConnectWise URL uses a port that is not approved for this host."
+        : "ConnectWise URL is not an approved ConnectWise origin.",
+    );
   }
 
   const hostname = url.hostname.replace(/^\[|\]$/g, "");

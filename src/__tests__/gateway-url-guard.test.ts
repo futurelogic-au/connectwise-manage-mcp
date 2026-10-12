@@ -7,6 +7,16 @@ import { CwManageClient, type CwManageConfig } from "../api-client.js";
 import { resolveGatewayConfig } from "../mcp-server.js";
 import { assertSafeGatewayUrl, isPublicIp } from "../url-guard.js";
 
+// These tests exercise the shape, DNS and redirect rules through
+// cw.example.com, so the operator approves that origin for them. The origin
+// allowlist itself is covered in gateway-url-allowlist.test.ts.
+beforeEach(() => {
+  vi.stubEnv("CW_MANAGE_ALLOWED_ORIGINS", "https://cw.example.com,https://nope.example.com");
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 function fakeResponse(body: unknown, status = 200): Response {
   return {
     ok: status < 400,
