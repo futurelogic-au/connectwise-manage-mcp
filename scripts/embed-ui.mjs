@@ -10,7 +10,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const html = readFileSync(path.join(root, "ui/dist/index.html"), "utf-8");
+// Line endings are normalised to LF so a build on Windows (autocrlf checkout)
+// embeds the same bytes as a build on Linux or CI.
+const html = readFileSync(path.join(root, "ui/dist/index.html"), "utf-8").replace(/\r\n?/g, "\n");
 const outDir = path.join(root, "src/generated");
 mkdirSync(outDir, { recursive: true });
 writeFileSync(

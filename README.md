@@ -68,7 +68,8 @@ If your self-hosted instance uses a self-signed certificate, also set `CW_MANAGE
 ### Interactive Ticket Card (MCP Apps)
 
 `cw_get_ticket` renders as an interactive card in MCP Apps hosts
-(Claude Desktop/web) with an in-card "Add note" round-trip via
+(Claude Desktop/web). The card reads the `_card` payload from the tool result's
+`structuredContent`, and falls back to parsing a text block. It has an in-card "Add note" round-trip via
 `cw_add_ticket_note` that always posts internal-only (`internalAnalysisFlag`)
 notes; plain-JSON behavior is unchanged in other hosts. The card is neutral by
 default and brandable via `window.__BRAND__` injection or `MCP_BRAND_*` env
@@ -78,15 +79,16 @@ needed.
 
 ### Tickets
 - `cw_search_tickets` — Search service tickets with conditions
-- `cw_get_ticket` — Get a ticket by ID
+- `cw_get_ticket`: Get a ticket by ID. Optional `lean: true` returns only `id`, `summary`, `board`, `status`, `owner`, `company` and `_info.lastUpdated`, with no ticket card
 - `cw_get_ticket_configurations` — List configuration references associated with a service ticket (paged)
 - `cw_update_ticket_configurations` — Add/remove ticket configuration associations in an ordered batch, reporting every outcome
 - `cw_create_ticket` — Create a new service ticket. Optional `parentTicketId` (the same field `cw_get_ticket` returns) creates the ticket as a child of that parent.
-- `cw_update_ticket` — Update a ticket (JSON Patch)
+- `cw_update_ticket`: Update a ticket (JSON Patch). Optional `lean: true` returns the lean shape above instead of the full saved ticket
+- `cw_bulk_update_tickets`: Apply one JSON Patch to up to 25 tickets. Needs `confirm: true`; without it nothing is written and the plan is returned. Tickets run one after another and one failure does not stop the rest. Each ticket gets one lean row, read back after the patch, and an optional shared `note` is added as an internal note that is never emailed
 - `cw_get_ticket_tasks`: Get every task on a ticket (the Tasks tab checklist), lean: `id`, `notes`, `closedFlag`, `priority`, `resolution`
 - `cw_update_ticket_task`: Close, reopen or reword one task on a ticket. Changes `closedFlag` and `notes` only, needs `confirm: true`, and reads the task back. There is no delete tool for ticket tasks
 - `cw_get_ticket_notes` — Get all notes on a ticket (including child ticket notes)
-- `cw_add_ticket_note` — Add a note to a ticket (discussion, internal, or resolution). Optional `emailContactFlag`, `emailResourceFlag`, `emailCcFlag`, and `emailCc` control who is emailed. **Nothing is emailed unless one of those flags is set** (or you set `processNotifications`). Omitting them does not email the contact. The create response reports `internalFlag` / `externalFlag` from the note type that was stored, so an internal note is not also reported as external.
+- `cw_add_ticket_note`: Add a note to a ticket (discussion, internal, or resolution). Optional `emailContactFlag`, `emailResourceFlag`, `emailCcFlag`, and `emailCc` control who is emailed. **Nothing is emailed unless one of those flags is set** (or you set `processNotifications`). Omitting them does not email the contact. A note that will email needs `confirm: true`. This ConnectWise version refuses recipient fields on a note, so the tool holds the matching `automaticEmail*` fields on the ticket for that one note, posts the note, puts the ticket's values back and reads them to check. A recipient you do not name is off for that note. Every response carries an `email` block with a `sent` indicator; ConnectWise does not report delivery, so `sent` means the note was posted with mail requested. The create response reports `internalFlag` / `externalFlag` from the note type that was stored, so an internal note is not also reported as external.
 
 ### Companies
 - `cw_search_companies` — Search companies
