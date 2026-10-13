@@ -172,6 +172,22 @@ export function registerTicketMergeTools(server: McpServer, client: CwManageClie
         }
       }
 
+      // A status the caller passed has no name yet. Read it from the children's boards so the
+      // plan, the result and the parent note name it, not a bare id.
+      if (mergeStatusId !== undefined && mergeStatusName === null) {
+        const boardIds = [...new Set(childRecords.map((t) => t.board?.id))].filter(
+          (value): value is number => typeof value === "number",
+        );
+        for (const boardId of boardIds) {
+          const statuses = await fetchAllPages<BoardStatus>(client, `/service/boards/${boardId}/statuses`);
+          const match = statuses.find((s) => s.id === mergeStatusId);
+          if (match) {
+            mergeStatusName = match.name ?? null;
+            break;
+          }
+        }
+      }
+
       const plan = {
         parent: row(parent),
         children: childRecords.map(row),

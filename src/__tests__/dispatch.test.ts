@@ -277,6 +277,26 @@ describe("cw_delete_schedule_entry", () => {
     expect(cw.state.entries[501]).toBeDefined();
   });
 
+  it.each([
+    ["its name when it has one", { id: 4, name: "Service", identifier: "S" }, "Service"],
+    ["the ticket kind when it has only an identifier S", { id: 4, identifier: "S" }, "service"],
+    ["the ticket kind when it has only an identifier P", { id: 5, identifier: "P" }, "project"],
+  ])("shows the booking type in the plan from %s", async (_label, type, expected) => {
+    fakeConnectWise({ entries: { 501: entry({ type }) } });
+
+    const result = await call("cw_delete_schedule_entry", { id: 501, reason: "Booked on the wrong ticket" });
+
+    expect((body(result) as { entry: { type: string | null } }).entry.type).toBe(expected);
+  });
+
+  it("falls back to the identifier for a type that does not link to a ticket", async () => {
+    fakeConnectWise({ entries: { 501: entry({ type: { id: 9, identifier: "N" } }) } });
+
+    const result = await call("cw_delete_schedule_entry", { id: 501, reason: "Wrong booking", confirm: true });
+
+    expect(body(result)).toMatchObject({ refused: true, entry: { type: "N" } });
+  });
+
   it("refuses a short reason before any request", async () => {
     const cw = fakeConnectWise({ entries: { 501: entry() } });
     const result = await call("cw_delete_schedule_entry", { id: 501, reason: "no", confirm: true });
@@ -460,6 +480,43 @@ describe("cw_merge_tickets", () => {
     expect(cw.calls.indexOf(noteCall)).toBeGreaterThan(cw.calls.indexOf(merge));
   });
 
+  it("names a status the caller passed, in the plan, the result and the parent note", async () => {
+    const cw = mergeWorld();
+
+    const plan = await call("cw_merge_tickets", { parentId: 10, childIds: [11, 12], statusId: 9 });
+    expect(body(plan)).toMatchObject({ plan: { status: { id: 9, name: "Closed" } } });
+
+    const result = await call("cw_merge_tickets", { parentId: 10, childIds: [11, 12], statusId: 9, confirm: true });
+
+    const out = body(result) as { status: { id: number; name: string | null }; note: { text: string } };
+    expect(out.status).toEqual({ id: 9, name: "Closed" });
+    expect(out.note.text).toContain('closed with the status "Closed"');
+    expect(out.note.text).not.toMatch(/status id \d+/);
+    expect(cw.calls.find((c) => c.path === "/service/tickets/10/merge")!.body).toEqual({
+      mergeTicketIds: [11, 12],
+      status: { id: 9 },
+    });
+  });
+
+  it("names the passed status from the board even when it is not the board's closed one", async () => {
+    mergeWorld();
+
+    const result = await call("cw_merge_tickets", { parentId: 10, childIds: [11], statusId: 1, confirm: true });
+
+    const out = body(result) as { note: { text: string } };
+    expect(out.note.text).toContain('closed with the status "New"');
+  });
+
+  it("falls back to the id when the passed status is not on the children's board", async () => {
+    mergeWorld();
+
+    const result = await call("cw_merge_tickets", { parentId: 10, childIds: [11], statusId: 77, confirm: true });
+
+    const out = body(result) as { status: { id: number; name: string | null }; note: { text: string } };
+    expect(out.status).toEqual({ id: 77, name: null });
+    expect(out.note.text).toContain("closed with the status id 77");
+  });
+
   it("stops and lists the statuses when the board has more than one closed status", async () => {
     const cw = mergeWorld({
       statuses: {
@@ -499,8 +556,11 @@ describe("cw_merge_tickets", () => {
       mergeTicketIds: [11],
       status: { id: 10 },
     });
-    // The board was not read, because the caller named the status.
-    expect(cw.calls.some((c) => c.path.includes("/statuses"))).toBe(false);
+    // The caller's status is used as given, not replaced by the board's closed status. The
+    // board is read only to give that status its name, and that read is a GET.
+    const statusReads = cw.calls.filter((c) => c.path.includes("/statuses"));
+    expect(statusReads.length).toBeGreaterThan(0);
+    expect(statusReads.every((c) => c.method === "GET")).toBe(true);
   });
 
   it.each([
