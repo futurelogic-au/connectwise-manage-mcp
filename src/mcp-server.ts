@@ -41,6 +41,7 @@ import { registerAgreementExclusionTools } from "./tools/agreement-exclusions.js
 import { registerExpenseTools } from "./tools/expenses.js";
 import { registerSetupTools } from "./tools/setup.js";
 import { registerTemplateTools } from "./tools/templates.js";
+import { registerTimeSheetTools } from "./tools/time-sheets.js";
 
 export type { CwManageConfig };
 
@@ -190,6 +191,7 @@ export function createMcpServer(configOverride?: CwManageConfig): McpServer {
   registerExpenseTools(server, client);
   registerSetupTools(server, client);
   registerTemplateTools(server, client);
+  registerTimeSheetTools(server, client);
 
   return server;
 }
