@@ -328,7 +328,7 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
 
   server.tool(
     "cw_bulk_update_tickets",
-    `Apply one JSON Patch to a list of service tickets, for example to change the owner or status of several tickets at once. Requires confirm: true. Without it nothing is written and the planned change is returned. Tickets are updated one after another, at most ${BULK_TICKET_LIMIT} per call. One failure does not stop the rest: every ticket gets one row, either a lean success row or an error row. The response carries requested, succeeded and failed counts with the rows. It is flagged as a tool error only when every row failed: a mixed result is not an error, so read the rows. After each patch the ticket is read back and the row reports whether the fresh read holds the values that were sent. An optional note is added to each ticket as an internal note (never emailed) after its patch succeeds. Every row is lean: id, summary, board, status, owner, company and _info.lastUpdated.`,
+    `Apply one JSON Patch to a list of service tickets, for example to change the owner or status of several tickets at once. Requires confirm: true. Without it nothing is written and the planned change is returned. Tickets are updated one after another, at most ${BULK_TICKET_LIMIT} per call. One failure does not stop the rest: every ticket gets one row, either a lean success row or an error row. The response carries four counts with the rows, and no ticket sits in more than one of saved and failed: requested, saved (the patch was saved), failed (the patch was not saved), and inside saved, unverified (the read back failed or did not hold the values sent) and noteFailed (the note was not added). It is flagged as a tool error only when no patch was saved: any other result is not an error, so read the counts and the rows. After each patch the ticket is read back and the row reports whether the fresh read holds the values that were sent. An optional note is added to each ticket as an internal note (never emailed) after its patch is saved, including when the read back failed. Every row is lean: id, summary, board, status, owner, company and _info.lastUpdated.`,
     {
       ids: z
         .array(z.number().int().positive())
@@ -406,28 +406,28 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
         }
 
         // Read the ticket back so the row reports what ConnectWise now holds,
-        // not what was sent.
-        let fresh: unknown;
+        // not what was sent. A failed read back leaves the patch saved, so the
+        // row stays a saved row and the note is still added.
+        let row: Record<string, unknown>;
         try {
-          fresh = await client.get<Record<string, unknown>>(path);
+          const fresh = await client.get<Record<string, unknown>>(path);
+          const check = checkPatchAgainstRecord(fresh, operations);
+          row = {
+            id,
+            success: true,
+            verified: check.mismatches.length === 0,
+            ...(check.mismatches.length > 0 ? { mismatches: check.mismatches } : {}),
+            ...(check.unchecked.length > 0 ? { unchecked: check.unchecked } : {}),
+            ticket: toLeanTicket(fresh),
+          };
         } catch (err: unknown) {
-          rows.push({
+          row = {
             id,
             success: true,
             verified: false,
             error: `The patch was saved but the read back failed: ${errorMessage(err)}`,
-          });
-          continue;
+          };
         }
-        const check = checkPatchAgainstRecord(fresh, operations);
-        const row: Record<string, unknown> = {
-          id,
-          success: true,
-          verified: check.mismatches.length === 0,
-          ...(check.mismatches.length > 0 ? { mismatches: check.mismatches } : {}),
-          ...(check.unchecked.length > 0 ? { unchecked: check.unchecked } : {}),
-          ticket: toLeanTicket(fresh),
-        };
 
         if (note !== undefined) {
           try {
@@ -443,24 +443,26 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
         rows.push(row);
       }
 
-      const failed = rows.filter(
-        (row) =>
-          row.success !== true ||
-          row.verified === false ||
-          (row.note as { added?: boolean } | undefined)?.added === false,
-      ).length;
+      // saved and failed split the rows on whether the patch was saved, so no row
+      // is in both. unverified and noteFailed count saved rows that need a look.
+      const savedRows = rows.filter((row) => row.success === true);
+      const saved = savedRows.length;
       return {
         content: [
           jsonText({
             requested: ids.length,
-            succeeded: rows.filter((row) => row.success === true).length,
-            failed,
+            saved,
+            unverified: savedRows.filter((row) => row.verified === false).length,
+            noteFailed: savedRows.filter(
+              (row) => (row.note as { added?: boolean } | undefined)?.added === false,
+            ).length,
+            failed: rows.length - saved,
             rows,
           }),
         ],
-        // A mixed result is a result, not a tool error: the caller reads the rows. The
-        // call is an error only when every row failed.
-        isError: failed === rows.length,
+        // A tool error means nothing changed. Where any patch was saved the caller
+        // reads the counts and the rows.
+        isError: saved === 0,
       };
     },
   );

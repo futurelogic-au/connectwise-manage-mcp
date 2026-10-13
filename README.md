@@ -102,7 +102,7 @@ needed.
 - `cw_create_ticket` — Create a new service ticket. Optional `parentTicketId` (the same field `cw_get_ticket` returns) creates the ticket as a child of that parent.
 - `cw_update_ticket`: Update a ticket (JSON Patch). Optional `lean: true` returns the lean shape above instead of the full saved ticket. A patch that changes the ticket's company needs `confirm: true`. If ConnectWise refuses the save because the company is in a status that does not allow saving a service ticket, nothing is changed and the reply names the company and its status; pass `newCompanyId` with `confirm: true` to save the patch and move the ticket in one call
 - `cw_merge_tickets`: Merge up to 25 tickets into a parent, as the ConnectWise merge does (`POST /service/tickets/{id}/merge`). Needs `confirm: true`. Parent and children must be open and in the same company. The closed status for the merged tickets is read from their board: one closed status is used, otherwise the tool lists them and you pass `statusId`. A `statusId` you pass is named from the board in the plan, the result and the parent note. Adds an internal note on the parent listing what was merged and reads everything back
-- `cw_bulk_update_tickets`: Apply one JSON Patch to up to 25 tickets. Needs `confirm: true`; without it nothing is written and the plan is returned. Tickets run one after another and one failure does not stop the rest. The response gives `requested`, `succeeded` and `failed` counts with the rows, and is flagged as an error only when every row failed. Each ticket gets one lean row, read back after the patch, and an optional shared `note` is added as an internal note that is never emailed
+- `cw_bulk_update_tickets`: Apply one JSON Patch to up to 25 tickets. Needs `confirm: true`; without it nothing is written and the plan is returned. Tickets run one after another and one failure does not stop the rest. The response gives `requested`, `saved` and `failed` counts with the rows: `saved` is every ticket whose patch was saved and `failed` is every ticket whose patch was not, so no ticket is in both. Inside `saved`, `unverified` counts a read back that failed or did not match, and `noteFailed` counts a note that was not added. It is flagged as an error only when no patch was saved. Each ticket gets one lean row, read back after the patch, and an optional shared `note` is added as an internal note that is never emailed
 - `cw_get_ticket_tasks`: Get every task on a ticket (the Tasks tab checklist), lean: `id`, `notes`, `closedFlag`, `priority`, `resolution`
 - `cw_update_ticket_task`: Close, reopen or reword one task on a ticket. Changes `closedFlag` and `notes` only, needs `confirm: true`, and reads the task back. There is no delete tool for ticket tasks
 - `cw_get_ticket_notes` — Get all notes on a ticket (including child ticket notes)
@@ -163,6 +163,17 @@ needed.
 - `cw_list_boards` — List service boards
 - `cw_list_priorities` — List ticket priorities
 - `cw_list_statuses` — List statuses for a board
+
+### Setup (read-only)
+These tools read the setup that decides where a service ticket lands and who owns it. There is no create, update or delete tool for any setup table.
+- `cw_get_board`: One service board, as the full record, with its auto-assign resources
+- `cw_list_board_teams` / `cw_get_board_team`: Board teams, each with its default flag, its team leader and its members named
+- `cw_list_board_statuses` / `cw_get_board_status`: Board statuses with the closed, inactive and escalation flags. The list reads all pages, in sort order
+- `cw_list_board_types` / `cw_get_board_type` / `cw_get_board_subtype`: Ticket types and subtypes on a board. A subtype lists the types it can be used with
+- `cw_list_workflow_rules` / `cw_get_workflow_rule`: Workflow rules, filtered by board or to active rules. The get returns every event with its condition and every action under it
+- `cw_list_email_connectors` / `cw_get_email_connector`: Email connectors with the board each files to, its default member and its overrides. The get returns the parsing styles and the mail-handling rules under each
+- `cw_list_slas` / `cw_get_sla`: SLAs. The get returns the per-priority targets
+- `cw_trace_ticket_routing`: Given a ticket id, shows why the ticket sits on its board and team and why it had the owner it arrived with. `arrivedOwner` is the owner before the first owner change in the audit trail, `ownerChanges` lists every change since, and `autoAssigned` lists the members the board assigned by itself at creation. `candidates` lists every piece of setup that explains the arrived owner: evidence `audit` means the audit trail shows it happened, evidence `setup` means the setup only allows it. It also returns the board's auto-assign setup, the ticket's team and the default team, the email connectors that file to the board, and the board's active workflow rules. Each workflow event carries `conditionMatch`, its condition evaluated against the ticket as it is now, and `ranOnTicket`, how often the audit trail says it ran on this ticket. Status, priority and actual age terms are evaluated; any other trigger is reported as `unknown`, never guessed. A section that cannot be read is named in `unread`
 
 ### Activities
 - `cw_search_activities` — Search activities
