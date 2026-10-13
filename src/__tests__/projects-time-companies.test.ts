@@ -209,7 +209,47 @@ const writes = (calls: Call[]) => calls.filter((c) => c.method !== "GET");
 afterEach(() => vi.unstubAllGlobals());
 
 describe("cw_create_project", () => {
-  const base = { name: "WS3 test project", boardId: 4, companyId: 250 };
+  const dates = { estimatedStart: "2026-11-02T00:00:00Z", estimatedEnd: "2026-11-30T00:00:00Z" };
+  const base = { name: "WS3 test project", boardId: 4, companyId: 250, ...dates };
+  const withoutDates = { name: "WS3 test project", boardId: 4, companyId: 250 };
+  const billing = { billingMethod: "ActualRates", agreementId: 91 };
+
+  it("requires estimatedStart and estimatedEnd in the tool schema", async () => {
+    const tools = (
+      await mcp<{ tools: { name: string; inputSchema: { required?: string[] } }[] }>("tools/list", {})
+    ).result.tools;
+    const tool = tools.find((t) => t.name === "cw_create_project")!;
+    expect(tool.inputSchema.required).toEqual(expect.arrayContaining(["estimatedStart", "estimatedEnd"]));
+  });
+
+  it.each([
+    ["no dates", {}],
+    ["no end date", { estimatedStart: dates.estimatedStart }],
+    ["no start date", { estimatedEnd: dates.estimatedEnd }],
+    ["a blank start date", { ...dates, estimatedStart: "   " }],
+    ["an empty end date", { ...dates, estimatedEnd: "" }],
+    ["a start date that is not a date", { ...dates, estimatedStart: "next Tuesday" }],
+  ])("refuses %s before any request, even with confirm: true", async (_label, extra) => {
+    const cw = fakeConnectWise();
+
+    const result = await call("cw_create_project", { ...withoutDates, ...billing, ...extra, confirm: true });
+
+    expect(result.isError).toBe(true);
+    expect(cw.fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("sends both dates in the create body and in the planned body", async () => {
+    const cw = fakeConnectWise();
+
+    const plan = await call("cw_create_project", { ...base, ...billing });
+    expect(body(plan)).toMatchObject({ saved: false, planned: dates });
+    expect(cw.fetchMock).not.toHaveBeenCalled();
+
+    const created = await call("cw_create_project", { ...base, ...billing, confirm: true });
+    expect(created.isError).not.toBe(true);
+    expect(cw.calls[0].body).toMatchObject(dates);
+    expect(body(created)).toMatchObject({ project: dates });
+  });
 
   it("requires billingMethod and agreementId, with no default", async () => {
     const tools = (

@@ -128,7 +128,7 @@ needed.
 ### Projects
 - `cw_search_projects` — Search projects
 - `cw_get_project` — Get a project by ID
-- `cw_create_project`: Create a new project. `billingMethod` (`ActualRates`, `FixedFee`, `NotToExceed` or `OverrideRate`) and `agreementId` (an agreement ID, or `null` for none) are required and have no default. Needs `confirm: true`, and reads the project back
+- `cw_create_project`: Create a new project. `billingMethod` (`ActualRates`, `FixedFee`, `NotToExceed` or `OverrideRate`) and `agreementId` (an agreement ID, or `null` for none) are required and have no default. `estimatedStart` and `estimatedEnd` (ISO 8601) are required too, because ConnectWise rejects a project without them: a call that leaves one out is refused before any request. Needs `confirm: true`, and reads the project back
 - `cw_list_project_phases`: List the phases of a project, to find the `phaseId` a project ticket needs
 - `cw_create_project_ticket`: Create a ticket on a project phase (`POST /project/tickets`). Needs `confirm: true`, checks the phase belongs to the project, and reads the ticket back
 - `cw_search_project_tickets` — Search tickets under a project

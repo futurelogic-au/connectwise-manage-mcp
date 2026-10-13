@@ -11,6 +11,13 @@ const PROJECT_READ_ONLY = { readOnlyHint: true };
 /** Creating a project or a project ticket only adds a record. */
 const PROJECT_ADDITIVE_WRITE = { readOnlyHint: false, destructiveHint: false };
 
+/** A project date: present, not blank, and one that Date can read. Refused before any request. */
+const PROJECT_DATE = z
+  .string()
+  .trim()
+  .min(1, "A date is required")
+  .refine((value) => !Number.isNaN(Date.parse(value)), "Must be an ISO 8601 date, such as 2026-11-02T00:00:00Z");
+
 function text(value: unknown) {
   return { type: "text" as const, text: JSON.stringify(value, null, 2) };
 }
@@ -203,7 +210,7 @@ export function registerProjectTools(server: McpServer, client: CwManageClient) 
 
   server.tool(
     "cw_create_project",
-    "Create a new project. billingMethod and agreementId are required and have no default: say how the project bills, and which agreement it bills to (or null for none). Requires confirm: true. Without it nothing is written and the planned body is returned. After the write the project is read back and the response is that fresh read, with a verified flag for the billing method and agreement.",
+    "Create a new project. billingMethod and agreementId are required and have no default: say how the project bills, and which agreement it bills to (or null for none). estimatedStart and estimatedEnd are required too, because ConnectWise rejects a project without them; a call that leaves one out is refused before any request. Requires confirm: true. Without it nothing is written and the planned body is returned. After the write the project is read back and the response is that fresh read, with a verified flag for the billing method and agreement.",
     {
       name: z.string().max(100).describe("Project name"),
       boardId: z.number().describe("Project board ID"),
@@ -222,8 +229,8 @@ export function registerProjectTools(server: McpServer, client: CwManageClient) 
         .nonnegative()
         .optional()
         .describe("Amount for FixedFee or NotToExceed. Omit for ActualRates"),
-      estimatedStart: z.string().optional().describe("Estimated start date (ISO 8601)"),
-      estimatedEnd: z.string().optional().describe("Estimated end date (ISO 8601)"),
+      estimatedStart: PROJECT_DATE.describe("Estimated start date (ISO 8601). Required: ConnectWise rejects a project without it"),
+      estimatedEnd: PROJECT_DATE.describe("Estimated end date (ISO 8601). Required: ConnectWise rejects a project without it"),
       description: z.string().optional().describe("Project description"),
       managerId: z.number().optional().describe("Project manager member ID"),
       confirm: z
@@ -253,8 +260,8 @@ export function registerProjectTools(server: McpServer, client: CwManageClient) 
       };
       if (agreementId !== null) body.agreement = { id: agreementId };
       if (billingAmount !== undefined) body.billingAmount = billingAmount;
-      if (estimatedStart) body.estimatedStart = estimatedStart;
-      if (estimatedEnd) body.estimatedEnd = estimatedEnd;
+      body.estimatedStart = estimatedStart;
+      body.estimatedEnd = estimatedEnd;
       if (description) body.description = description;
       if (managerId) body.manager = { id: managerId };
 
