@@ -139,7 +139,7 @@ needed.
 ### Time Entries
 - `cw_search_time_entries` — Search time entries
 - `cw_get_time_entry` — Get a time entry by ID
-- `cw_create_time_entry`: Create a new time entry. `billableOption` (`Billable`, `DoNotBill`, `NoCharge` or `NoDefault`) is set at creation, so no patch is needed. `timeSheetId` adds time to a submitted or past period, which ConnectWise otherwise refuses with "time period not open". A closed ticket refuses new time: the tool says so and never reopens the ticket. Needs `confirm: true`; without it nothing is written and the planned body is returned
+- `cw_create_time_entry`: Create a new time entry. `billableOption` (`Billable`, `DoNotBill`, `NoCharge` or `NoDefault`) is set at creation, so no patch is needed. `timeSheetId` adds time to a submitted or past period, which ConnectWise otherwise refuses with "time period not open"; that refusal comes back as `reason: "time-period-not-open"` with the fix named. A closed ticket refuses new time: the tool says so and never reopens the ticket. Needs `confirm: true`; without it nothing is written and the planned body is returned
 - `cw_update_time_entry` — Correct a time entry (JSON Patch on `PATCH /time/entries/{id}`). Use this to fix `actualHours` when a metered agreement rounds to 0.25.
 - `cw_delete_time_entry` — Delete a time entry (`DELETE /time/entries/{id}`). Manage rejects deletes of entries that are already billed.
 

@@ -51,6 +51,10 @@ function body(result: ToolResult): Rec {
   return JSON.parse(result.content[0].text) as Rec;
 }
 
+/** ConnectWise's own words for a time period that is not open, as the WS3 live proof saw them. */
+const LIVE_PERIOD_REFUSAL =
+  "Time period specified is invalid or not open, provide a new date for this time entry.";
+
 function jsonResponse(payload: unknown, status = 200) {
   return new Response(status === 204 ? null : JSON.stringify(payload), {
     status,
@@ -80,6 +84,8 @@ interface World {
   dropBillable: boolean;
   /** Refuse a time entry with no timeSheet as "time period not open". */
   periodClosed: boolean;
+  /** The 400 body for that refusal. Default: ConnectWise's own wording, as seen live. */
+  refusalBody: Rec | null;
   /** Status the nested typeAssociations POST answers, when not 2xx. */
   nestedPostStatus: number | null;
 }
@@ -97,6 +103,7 @@ function fakeConnectWise(initial: Partial<World> = {}) {
     dropPhase: false,
     dropBillable: false,
     periodClosed: false,
+    refusalBody: null,
     nestedPostStatus: null,
     ...initial,
   };
@@ -142,7 +149,7 @@ function fakeConnectWise(initial: Partial<World> = {}) {
 
     if (path === "/time/entries" && method === "POST") {
       if (world.periodClosed && !payload?.timeSheet) {
-        return jsonResponse({ code: "InvalidObject", message: "The time period is not open for this entry." }, 400);
+        return jsonResponse(world.refusalBody ?? { code: "InvalidObject", message: LIVE_PERIOD_REFUSAL }, 400);
       }
       const record: Rec = { id: 800, ...payload };
       if (world.dropBillable) delete record.billableOption;
@@ -468,6 +475,51 @@ describe("cw_create_time_entry", () => {
     expect(result.isError).toBe(true);
     expect(body(result)).toMatchObject({ saved: false, reason: "time-period-not-open" });
     expect(String(body(result).message)).toMatch(/Pass timeSheetId/);
+  });
+
+  it("matches ConnectWise's exact wording, which has 25 characters between 'time period' and 'not open'", async () => {
+    fakeConnectWise({ serviceTickets: openTicket, periodClosed: true });
+
+    const result = await call("cw_create_time_entry", entry);
+
+    // The pattern before this fix, which allowed 20 characters. It cannot see this text.
+    expect(/time period.{0,20}not open/i.test(LIVE_PERIOD_REFUSAL)).toBe(false);
+    expect(result.isError).toBe(true);
+    const out = body(result);
+    expect(out).toMatchObject({ saved: false, reason: "time-period-not-open" });
+    // Reshaped by the tool, not the raw upstream text.
+    expect(JSON.stringify(out)).not.toContain("returned 400");
+    expect(JSON.stringify(out)).not.toContain(LIVE_PERIOD_REFUSAL);
+  });
+
+  it("matches the wording when it arrives in a field error rather than the top message", async () => {
+    fakeConnectWise({
+      serviceTickets: openTicket,
+      periodClosed: true,
+      refusalBody: {
+        code: "InvalidObject",
+        message: "Validation failed.",
+        errors: [{ code: "InvalidObject", message: LIVE_PERIOD_REFUSAL, field: "timeStart" }],
+      },
+    });
+
+    const result = await call("cw_create_time_entry", entry);
+
+    expect(body(result)).toMatchObject({ saved: false, reason: "time-period-not-open" });
+  });
+
+  it("passes any other 400 through raw, and does not call it a closed period", async () => {
+    fakeConnectWise({
+      serviceTickets: openTicket,
+      periodClosed: true,
+      refusalBody: { code: "InvalidObject", message: "Time period specified is invalid." },
+    });
+
+    const result = await call("cw_create_time_entry", entry);
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/returned 400/);
+    expect(result.content[0].text).not.toMatch(/time-period-not-open/);
   });
 
   it("accepts the same entry once the sheet id is passed", async () => {
