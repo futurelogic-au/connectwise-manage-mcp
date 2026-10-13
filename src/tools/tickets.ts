@@ -328,7 +328,7 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
 
   server.tool(
     "cw_bulk_update_tickets",
-    `Apply one JSON Patch to a list of service tickets, for example to change the owner or status of several tickets at once. Requires confirm: true. Without it nothing is written and the planned change is returned. Tickets are updated one after another, at most ${BULK_TICKET_LIMIT} per call. One failure does not stop the rest: every ticket gets one row, either a lean success row or an error row. After each patch the ticket is read back and the row reports whether the fresh read holds the values that were sent. An optional note is added to each ticket as an internal note (never emailed) after its patch succeeds. Every row is lean: id, summary, board, status, owner, company and _info.lastUpdated.`,
+    `Apply one JSON Patch to a list of service tickets, for example to change the owner or status of several tickets at once. Requires confirm: true. Without it nothing is written and the planned change is returned. Tickets are updated one after another, at most ${BULK_TICKET_LIMIT} per call. One failure does not stop the rest: every ticket gets one row, either a lean success row or an error row. The response carries requested, succeeded and failed counts with the rows. It is flagged as a tool error only when every row failed: a mixed result is not an error, so read the rows. After each patch the ticket is read back and the row reports whether the fresh read holds the values that were sent. An optional note is added to each ticket as an internal note (never emailed) after its patch succeeds. Every row is lean: id, summary, board, status, owner, company and _info.lastUpdated.`,
     {
       ids: z
         .array(z.number().int().positive())
@@ -458,7 +458,9 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
             rows,
           }),
         ],
-        isError: failed > 0,
+        // A mixed result is a result, not a tool error: the caller reads the rows. The
+        // call is an error only when every row failed.
+        isError: failed === rows.length,
       };
     },
   );
