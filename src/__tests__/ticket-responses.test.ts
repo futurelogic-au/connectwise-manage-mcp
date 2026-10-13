@@ -448,7 +448,8 @@ describe("cw_bulk_update_tickets", () => {
     };
     expect(body).toMatchObject({ requested: 5, succeeded: 4, failed: 1 });
     expect(body.rows.map((row) => row.id)).toEqual([101, 102, 103, 104, 105]);
-    expect(result.isError).toBe(true);
+    // Four of five changed: a mixed result is read from the rows, not flagged as an error.
+    expect(result.isError).not.toBe(true);
 
     const failedRow = body.rows[2];
     expect(failedRow).toMatchObject({ id: 103, success: false });
@@ -486,13 +487,40 @@ describe("cw_bulk_update_tickets", () => {
     expect(rows[0].note).toEqual({ added: true, id: 9000 });
     expect(rows[1].note).toMatchObject({ added: false });
     expect(rows[1]).toMatchObject({ id: 2, success: true });
-    expect(result.isError).toBe(true);
+    // One ticket is fully good, so this is a mixed result and not a tool error.
+    expect(json(result)).toMatchObject({ requested: 2, failed: 1 });
+    expect(result.isError).not.toBe(true);
 
     const noteCall = cw.calls.find((c) => c.method === "POST" && c.path === "/service/tickets/1/notes")!;
     expect(noteCall.body).toEqual({
       text: "Reassigned in the board review",
       internalAnalysisFlag: true,
     });
+  });
+
+  it("flags a tool error only when every row failed, and still returns the counts and rows", async () => {
+    const tickets = { 1: fullTicket(1), 2: fullTicket(2), 3: fullTicket(3) };
+    fakeConnectWise(tickets, { failPatch: [1, 2, 3] });
+
+    const result = await call("cw_bulk_update_tickets", {
+      ids: [1, 2, 3],
+      operations: ownerChange,
+      confirm: true,
+    });
+
+    expect(result.isError).toBe(true);
+    const out = json(result) as { requested: number; succeeded: number; failed: number; rows: Array<Record<string, unknown>> };
+    expect(out).toMatchObject({ requested: 3, succeeded: 0, failed: 3 });
+    expect(out.rows.map((row) => row.success)).toEqual([false, false, false]);
+  });
+
+  it("does not flag a tool error when every row succeeded", async () => {
+    fakeConnectWise({ 1: fullTicket(1), 2: fullTicket(2) });
+
+    const result = await call("cw_bulk_update_tickets", { ids: [1, 2], operations: ownerChange, confirm: true });
+
+    expect(result.isError).not.toBe(true);
+    expect(json(result)).toMatchObject({ requested: 2, succeeded: 2, failed: 0 });
   });
 
   it("does not add the note to a ticket whose patch failed", async () => {

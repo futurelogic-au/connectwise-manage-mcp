@@ -349,13 +349,17 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
       const member = entry.member as NamedRef | undefined;
       const dateStart = typeof entry.dateStart === "string" ? entry.dateStart : undefined;
       const dateEnd = typeof entry.dateEnd === "string" ? entry.dateEnd : undefined;
+      const linked = linkedTicketPath(entry as { objectId?: unknown; type?: NamedRef | null });
+      const entryType = entry.type as NamedRef | null | undefined;
       const summary = {
         id,
         member: member ? { id: member.id ?? null, name: member.name ?? null } : null,
         dateStart: dateStart ?? null,
         dateEnd: dateEnd ?? null,
         objectId: typeof entry.objectId === "number" ? entry.objectId : null,
-        type: (entry.type as NamedRef | undefined)?.name ?? null,
+        // The type's name, else the ticket kind it resolves to, else its identifier. A type
+        // that carries only an identifier used to show as null.
+        type: entryType?.name ?? linked?.kind ?? entryType?.identifier ?? null,
       };
 
       // D9: future, not-done entries only.
@@ -374,7 +378,6 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
       }
 
       // The delete is recorded on the linked ticket, so there has to be one.
-      const linked = linkedTicketPath(entry as { objectId?: unknown; type?: NamedRef | null });
       if (!linked) {
         return refuse(
           `Schedule entry ${id} is not booked against a service ticket or a project ticket, so there is no ticket to carry the note. Nothing was changed.`,

@@ -5,10 +5,24 @@ import { CwApiError, CwManageClient, hasApiStatus } from "../api-client.js";
 /** How a time entry bills, as ConnectWise's TimeEntry.billableOption accepts it. */
 export const BILLABLE_OPTIONS = ["Billable", "DoNotBill", "NoCharge", "NoDefault"] as const;
 
-/** ConnectWise's refusal of an entry on a submitted or past period. */
-const TIME_PERIOD_NOT_OPEN = /time period.{0,20}not open/i;
+/**
+ * ConnectWise's refusal of an entry on a submitted or past period. The live text is
+ * "Time period specified is invalid or not open, provide a new date for this time
+ * entry.", which puts 25 characters between "time period" and "not open".
+ */
+const TIME_PERIOD_NOT_OPEN = /\btime period\b.{0,60}\bnot open\b/i;
 /** A closed ticket refusing time, should ConnectWise answer a 400 for it. */
 const TICKET_CLOSED = /ticket.{0,40}\bclosed\b/i;
+
+/**
+ * The words ConnectWise gave for a refusal: the allowlisted message and each field
+ * error's message. Matching on these, not on the whole error message, keeps the
+ * path and the reference id out of the test.
+ */
+function refusalText(err: CwApiError): string {
+  const parts = [err.detail?.message, ...(err.detail?.errors ?? []).map((e) => e.message)];
+  return parts.filter((part): part is string => typeof part === "string").join(" ");
+}
 
 export function registerTimeEntryTools(server: McpServer, client: CwManageClient) {
   server.tool(
@@ -161,7 +175,8 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
         result = await client.post<Record<string, unknown>>("/time/entries", body);
       } catch (err: unknown) {
         if (err instanceof CwApiError && err.status === 400) {
-          if (TIME_PERIOD_NOT_OPEN.test(err.message)) {
+          const refusal = refusalText(err);
+          if (TIME_PERIOD_NOT_OPEN.test(refusal)) {
             return fail(
               "time-period-not-open",
               timeSheetId === undefined
@@ -169,7 +184,7 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
                 : "ConnectWise refused the entry because its time period is not open, even with the time sheet passed. Check that timeSheetId is the member's sheet for the period of timeStart. Nothing was added.",
             );
           }
-          if (TICKET_CLOSED.test(err.message)) {
+          if (TICKET_CLOSED.test(refusal)) {
             return fail(
               "ticket-closed",
               `ConnectWise refused the entry because the ticket is closed. No time was added and the ticket was not reopened.`,

@@ -101,8 +101,8 @@ needed.
 - `cw_update_ticket_configurations` — Add/remove ticket configuration associations in an ordered batch, reporting every outcome
 - `cw_create_ticket` — Create a new service ticket. Optional `parentTicketId` (the same field `cw_get_ticket` returns) creates the ticket as a child of that parent.
 - `cw_update_ticket`: Update a ticket (JSON Patch). Optional `lean: true` returns the lean shape above instead of the full saved ticket. A patch that changes the ticket's company needs `confirm: true`. If ConnectWise refuses the save because the company is in a status that does not allow saving a service ticket, nothing is changed and the reply names the company and its status; pass `newCompanyId` with `confirm: true` to save the patch and move the ticket in one call
-- `cw_merge_tickets`: Merge up to 25 tickets into a parent, as the ConnectWise merge does (`POST /service/tickets/{id}/merge`). Needs `confirm: true`. Parent and children must be open and in the same company. The closed status for the merged tickets is read from their board: one closed status is used, otherwise the tool lists them and you pass `statusId`. Adds an internal note on the parent listing what was merged and reads everything back
-- `cw_bulk_update_tickets`: Apply one JSON Patch to up to 25 tickets. Needs `confirm: true`; without it nothing is written and the plan is returned. Tickets run one after another and one failure does not stop the rest. Each ticket gets one lean row, read back after the patch, and an optional shared `note` is added as an internal note that is never emailed
+- `cw_merge_tickets`: Merge up to 25 tickets into a parent, as the ConnectWise merge does (`POST /service/tickets/{id}/merge`). Needs `confirm: true`. Parent and children must be open and in the same company. The closed status for the merged tickets is read from their board: one closed status is used, otherwise the tool lists them and you pass `statusId`. A `statusId` you pass is named from the board in the plan, the result and the parent note. Adds an internal note on the parent listing what was merged and reads everything back
+- `cw_bulk_update_tickets`: Apply one JSON Patch to up to 25 tickets. Needs `confirm: true`; without it nothing is written and the plan is returned. Tickets run one after another and one failure does not stop the rest. The response gives `requested`, `succeeded` and `failed` counts with the rows, and is flagged as an error only when every row failed. Each ticket gets one lean row, read back after the patch, and an optional shared `note` is added as an internal note that is never emailed
 - `cw_get_ticket_tasks`: Get every task on a ticket (the Tasks tab checklist), lean: `id`, `notes`, `closedFlag`, `priority`, `resolution`
 - `cw_update_ticket_task`: Close, reopen or reword one task on a ticket. Changes `closedFlag` and `notes` only, needs `confirm: true`, and reads the task back. There is no delete tool for ticket tasks
 - `cw_get_ticket_notes` — Get all notes on a ticket (including child ticket notes)
@@ -128,7 +128,7 @@ needed.
 ### Projects
 - `cw_search_projects` — Search projects
 - `cw_get_project` — Get a project by ID
-- `cw_create_project`: Create a new project. `billingMethod` (`ActualRates`, `FixedFee`, `NotToExceed` or `OverrideRate`) and `agreementId` (an agreement ID, or `null` for none) are required and have no default. Needs `confirm: true`, and reads the project back
+- `cw_create_project`: Create a new project. `billingMethod` (`ActualRates`, `FixedFee`, `NotToExceed` or `OverrideRate`) and `agreementId` (an agreement ID, or `null` for none) are required and have no default. `estimatedStart` and `estimatedEnd` (ISO 8601) are required too, because ConnectWise rejects a project without them: a call that leaves one out is refused before any request. Needs `confirm: true`, and reads the project back
 - `cw_list_project_phases`: List the phases of a project, to find the `phaseId` a project ticket needs
 - `cw_create_project_ticket`: Create a ticket on a project phase (`POST /project/tickets`). Needs `confirm: true`, checks the phase belongs to the project, and reads the ticket back
 - `cw_search_project_tickets` — Search tickets under a project
@@ -139,7 +139,7 @@ needed.
 ### Time Entries
 - `cw_search_time_entries` — Search time entries
 - `cw_get_time_entry` — Get a time entry by ID
-- `cw_create_time_entry`: Create a new time entry. `billableOption` (`Billable`, `DoNotBill`, `NoCharge` or `NoDefault`) is set at creation, so no patch is needed. `timeSheetId` adds time to a submitted or past period, which ConnectWise otherwise refuses with "time period not open". A closed ticket refuses new time: the tool says so and never reopens the ticket. Needs `confirm: true`; without it nothing is written and the planned body is returned
+- `cw_create_time_entry`: Create a new time entry. `billableOption` (`Billable`, `DoNotBill`, `NoCharge` or `NoDefault`) is set at creation, so no patch is needed. `timeSheetId` adds time to a submitted or past period, which ConnectWise otherwise refuses with "time period not open"; that refusal comes back as `reason: "time-period-not-open"` with the fix named. A closed ticket refuses new time: the tool says so and never reopens the ticket. Needs `confirm: true`; without it nothing is written and the planned body is returned
 - `cw_update_time_entry` — Correct a time entry (JSON Patch on `PATCH /time/entries/{id}`). Use this to fix `actualHours` when a metered agreement rounds to 0.25.
 - `cw_delete_time_entry` — Delete a time entry (`DELETE /time/entries/{id}`). Manage rejects deletes of entries that are already billed.
 
@@ -149,7 +149,7 @@ needed.
 - `cw_list_schedule_statuses` — List schedule statuses (Tentative, Firm)
 - `cw_create_schedule_entry` — Book resource time against a ticket, activity or project ticket
 - `cw_update_schedule_entry` — Update a schedule entry (JSON Patch)
-- `cw_delete_schedule_entry`: Delete a wrong booking. Needs `confirm: true` and a `reason`. Only a future entry that is not done is deleted: a done entry, a started entry, an entry with time logged against it, or an entry not booked against a service or project ticket is refused. After the delete it adds an internal note to the linked ticket naming the member, the original Perth date and time, and the reason, then reads the entry and the note back
+- `cw_delete_schedule_entry`: Delete a wrong booking. Needs `confirm: true` and a `reason`. Only a future entry that is not done is deleted: a done entry, a started entry, an entry with time logged against it, or an entry not booked against a service or project ticket is refused. After the delete it adds an internal note to the linked ticket naming the member, the original Perth date and time, and the reason, then reads the entry and the note back. The plan and any refusal show the booking's `type`
 
 ### Members
 - `cw_search_members` — Search members/technicians
@@ -192,7 +192,7 @@ ConnectWise exposes additions only as children of a single agreement, with no cr
 - `cw_list_charge_codes`: List charge codes, for the `chargeCodeId` on a claim
 - `cw_search_expense_entries`: Search the owner's own expense entries by date range and amount. Each row carries the entry's company. The member is your own, from `CW_MANAGE_MEMBER_ID`; another member's ID is refused, and with the variable unset nothing is read
 - `cw_create_expense_entry`: Create one expense entry for the owner. `expenseTypeId` is required with no default. Every claim needs a charge-to: pass exactly one of `chargeCodeId` and `companyId`, with no default (neither, or both, is refused). A company is sent as the entry's company reference. `merchant` is required and written at the start of the notes (merchant `Ampol` with notes `Petrol` is stored as `Ampol, Petrol`). A duplicate check on date, amount and merchant runs first and a match is refused. Needs `confirm: true` and reads the entry back. There is no expense delete tool
-- `cw_attach_document`: Attach a receipt (`.pdf`, `.png`, `.jpg`, `.jpeg`, at most 10 MiB) to one of the owner's expense entries through `POST /system/documents`. The file is read from disk under `CW_MANAGE_ATTACH_ROOT` and is never moved, renamed or filed. Needs `confirm: true`, skips a file already on the entry, and reads the entry's documents back
+- `cw_attach_document`: Attach a receipt (`.pdf`, `.png`, `.jpg`, `.jpeg`, at most 10 MiB) to one of the owner's expense entries through `POST /system/documents`. The file is read from disk under `CW_MANAGE_ATTACH_ROOT` and is never moved, renamed or filed. Needs `confirm: true`, skips a file already on the entry, and reads the entry's documents back. If ConnectWise answers an upload with a document that was already on the entry, the response is `attached: false` and names that document
 
 ### Invoices
 - `cw_search_invoices` — Search invoices (CW `conditions`, `orderBy` e.g. `id desc`)
