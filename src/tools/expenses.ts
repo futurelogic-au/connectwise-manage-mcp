@@ -384,7 +384,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
 
   server.tool(
     "cw_attach_document",
-    `Attach a receipt to one of the owner's expense entries (POST /system/documents, multipart). Own claims only: the entry must belong to the member id in CW_MANAGE_MEMBER_ID. The file is read from disk and never moved, renamed or filed. It must be a .pdf, .png, .jpg or .jpeg of at most ${MAX_RECEIPT_BYTES / (1024 * 1024)} MiB, and it must sit under the folder named in the CW_MANAGE_ATTACH_ROOT environment variable. Without that variable nothing is attached. A file already on the entry with the same name and size is not attached twice. Requires confirm: true. Without it nothing is written and the file's name, size and SHA-256 are returned. After the upload the entry's documents are read back.`,
+    `Attach a receipt to one of the owner's expense entries (POST /system/documents, multipart). Own claims only: the entry must belong to the member id in CW_MANAGE_MEMBER_ID. The file is read from disk and never moved, renamed or filed. It must be a .pdf, .png, .jpg or .jpeg of at most ${MAX_RECEIPT_BYTES / (1024 * 1024)} MiB, and it must sit under the folder named in the CW_MANAGE_ATTACH_ROOT environment variable. Without that variable nothing is attached. A file already on the entry with the same name and size is not attached twice. If ConnectWise answers an upload with a document that was already on the entry, the response says attached: false and names that document. Requires confirm: true. Without it nothing is written and the file's name, size and SHA-256 are returned. After the upload the entry's documents are read back.`,
     {
       recordType: z.enum(["Expense"]).describe("What the document attaches to. Only Expense is supported"),
       recordId: z.number().int().positive().describe("Expense entry ID, from cw_create_expense_entry"),
@@ -467,9 +467,8 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
         recordId,
         pageSize: 100,
       });
-      const already = (Array.isArray(existing) ? existing : []).find(
-        (doc) => doc.fileName === fileName && doc.fileSize === stat.size,
-      );
+      const existingDocs = Array.isArray(existing) ? existing : [];
+      const already = existingDocs.find((doc) => doc.fileName === fileName && doc.fileSize === stat.size);
       if (already) {
         return {
           content: [
@@ -482,6 +481,11 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
           ],
         };
       }
+      // Ids on the entry before the upload. A document id that comes back from the upload
+      // and is in this set was not created by it.
+      const priorIds = new Set(
+        existingDocs.map((doc) => doc.id).filter((value): value is number => typeof value === "number"),
+      );
 
       const plan = { recordType, recordId, fileName, fileSize: stat.size, contentType, sha256, title: title ?? fileName };
       if (confirm !== true) {
@@ -512,9 +516,36 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
         recordId,
         pageSize: 100,
       });
-      const found = (Array.isArray(after) ? after : []).find(
-        (doc) => (documentId !== undefined && doc.id === documentId) || doc.fileName === fileName,
-      );
+      const afterDocs = Array.isArray(after) ? after : [];
+
+      // ConnectWise answered with a document that was already on the entry. Nothing new was
+      // added, so say that and name the document, not "attached".
+      if (documentId !== undefined && priorIds.has(documentId)) {
+        const prior = afterDocs.find((doc) => doc.id === documentId) ?? existingDocs.find((doc) => doc.id === documentId);
+        return {
+          content: [
+            text({
+              attached: false,
+              alreadyPresent: true,
+              message: `ConnectWise answered with document ${documentId}, which was already on the entry before this call. No new document was added.`,
+              document: {
+                id: documentId,
+                title: prior?.title ?? null,
+                fileName: prior?.fileName ?? null,
+                fileSize: prior?.fileSize ?? null,
+              },
+            }),
+          ],
+        };
+      }
+
+      // The new document is the one with the id the upload returned. A file name alone can
+      // match an older document of the same name, so it is used only when no id came back,
+      // and then only among documents that were not on the entry before.
+      const found =
+        documentId !== undefined
+          ? afterDocs.find((doc) => doc.id === documentId)
+          : afterDocs.find((doc) => doc.fileName === fileName && !priorIds.has(doc.id as number));
       const sizeMatches = found ? found.fileSize === undefined || found.fileSize === stat.size : false;
       const verified = found !== undefined && sizeMatches;
       return {

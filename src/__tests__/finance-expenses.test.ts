@@ -78,6 +78,8 @@ interface World {
   alterAmount: boolean;
   /** Make a created entry come back without its company. */
   dropCompany: boolean;
+  /** Answer an upload of a name already on the record with that document, creating none. */
+  dedupeDocuments: boolean;
 }
 
 function fakeConnectWise(initial: Partial<World> = {}) {
@@ -89,6 +91,7 @@ function fakeConnectWise(initial: Partial<World> = {}) {
     exclusions: {},
     alterAmount: false,
     dropCompany: false,
+    dedupeDocuments: false,
     ...initial,
   };
   const calls: Call[] = [];
@@ -150,6 +153,10 @@ function fakeConnectWise(initial: Partial<World> = {}) {
       const fileName = /filename="([^"]+)"/.exec(text)?.[1] ?? "";
       const recordId = Number(/name="recordId"\r\n\r\n(\d+)/.exec(text)?.[1]);
       const title = /name="Title"\r\n\r\n([^\r]*)/.exec(text)?.[1] ?? "";
+      if (world.dedupeDocuments) {
+        const same = world.documents.find((d) => d.recordId === recordId && d.fileName === fileName);
+        if (same) return jsonResponse(same);
+      }
       const fileSize = (payload as Uint8Array).byteLength; // overwritten below from the file part
       const filePart = text.split(/Content-Type: [^\r]+\r\n\r\n/)[1] ?? "";
       const record: Rec = {
@@ -863,6 +870,49 @@ describe("expense tools", () => {
       const result = await call("cw_attach_document", { recordType: "Expense", recordId: 900, filePath: file, confirm: true });
       expect(body(result)).toMatchObject({ attached: false, alreadyPresent: true });
       expect(writes(cw.calls)).toEqual([]);
+    });
+
+    it("says nothing was added, and names the document, when ConnectWise answers with one already on the entry", async () => {
+      // The listing has no fileSize, so the before-upload check cannot match on size and the
+      // upload goes out. ConnectWise answers it with the existing document's id.
+      const cw = fakeConnectWise({
+        entries: [entry],
+        documents: [{ id: 1, recordId: 900, title: "BP receipt", fileName: "bp-5-oct.pdf" }],
+        dedupeDocuments: true,
+      });
+      const file = await receipt();
+
+      const result = await call("cw_attach_document", { recordType: "Expense", recordId: 900, filePath: file, confirm: true });
+
+      expect(result.isError).not.toBe(true);
+      const out = body(result);
+      expect(out).toMatchObject({
+        attached: false,
+        alreadyPresent: true,
+        document: { id: 1, title: "BP receipt", fileName: "bp-5-oct.pdf" },
+      });
+      expect(String(out.message)).toMatch(/document 1, which was already on the entry/);
+      expect(out).not.toHaveProperty("verified");
+      expect(cw.world.documents).toHaveLength(1);
+    });
+
+    it("reports the new document, not an older one with the same name, when the upload creates one", async () => {
+      // An older document of the same name but a different size is a different receipt.
+      const cw = fakeConnectWise({
+        entries: [entry],
+        documents: [{ id: 1, recordId: 900, fileName: "bp-5-oct.pdf", fileSize: 5 }],
+      });
+      const file = await receipt();
+
+      const result = await call("cw_attach_document", { recordType: "Expense", recordId: 900, filePath: file, confirm: true });
+
+      expect(result.isError).not.toBe(true);
+      expect(body(result)).toMatchObject({
+        attached: true,
+        verified: true,
+        document: { id: 1100, fileName: "bp-5-oct.pdf", fileSize: pdf.length },
+      });
+      expect(cw.world.documents).toHaveLength(2);
     });
 
     it("only offers Expense as a record type", async () => {
