@@ -192,6 +192,8 @@ interface Call {
 interface FakeOptions {
   /** Ticket ids whose PATCH answers 400. */
   failPatch?: number[];
+  /** Ticket ids whose GET answers 500, so the read back after a saved patch fails. */
+  failRead?: number[];
   /** Ticket ids whose note POST answers 500. */
   failNote?: number[];
   /** Fail every PATCH that follows the first one on the ticket (a restore). */
@@ -231,7 +233,10 @@ function fakeConnectWise(tickets: Record<number, Record<string, unknown>>, optio
       const id = Number(ticketMatch[1]);
       const ticket = tickets[id];
       if (!ticket) return jsonResponse({ code: "NotFound", message: "Not found" }, 404);
-      if (method === "GET") return jsonResponse(ticket);
+      if (method === "GET") {
+        if (options.failRead?.includes(id)) return jsonResponse({ code: "ServerError", message: "boom" }, 500);
+        return jsonResponse(ticket);
+      }
       if (method === "PATCH") {
         patchCount[id] = (patchCount[id] ?? 0) + 1;
         if (options.failPatch?.includes(id)) {
@@ -442,11 +447,12 @@ describe("cw_bulk_update_tickets", () => {
 
     const body = json(result) as {
       requested: number;
-      succeeded: number;
+      saved: number;
       failed: number;
       rows: Array<Record<string, unknown>>;
     };
-    expect(body).toMatchObject({ requested: 5, succeeded: 4, failed: 1 });
+    expect(body).toMatchObject({ requested: 5, saved: 4, unverified: 0, noteFailed: 0, failed: 1 });
+    expect(body).not.toHaveProperty("succeeded");
     expect(body.rows.map((row) => row.id)).toEqual([101, 102, 103, 104, 105]);
     // Four of five changed: a mixed result is read from the rows, not flagged as an error.
     expect(result.isError).not.toBe(true);
@@ -487,8 +493,8 @@ describe("cw_bulk_update_tickets", () => {
     expect(rows[0].note).toEqual({ added: true, id: 9000 });
     expect(rows[1].note).toMatchObject({ added: false });
     expect(rows[1]).toMatchObject({ id: 2, success: true });
-    // One ticket is fully good, so this is a mixed result and not a tool error.
-    expect(json(result)).toMatchObject({ requested: 2, failed: 1 });
+    // Both patches were saved. The note that failed is counted on its own, not as a failed row.
+    expect(json(result)).toMatchObject({ requested: 2, saved: 2, unverified: 0, noteFailed: 1, failed: 0 });
     expect(result.isError).not.toBe(true);
 
     const noteCall = cw.calls.find((c) => c.method === "POST" && c.path === "/service/tickets/1/notes")!;
@@ -498,7 +504,7 @@ describe("cw_bulk_update_tickets", () => {
     });
   });
 
-  it("flags a tool error only when every row failed, and still returns the counts and rows", async () => {
+  it("flags a tool error only when no patch was saved, and still returns the counts and rows", async () => {
     const tickets = { 1: fullTicket(1), 2: fullTicket(2), 3: fullTicket(3) };
     fakeConnectWise(tickets, { failPatch: [1, 2, 3] });
 
@@ -509,8 +515,8 @@ describe("cw_bulk_update_tickets", () => {
     });
 
     expect(result.isError).toBe(true);
-    const out = json(result) as { requested: number; succeeded: number; failed: number; rows: Array<Record<string, unknown>> };
-    expect(out).toMatchObject({ requested: 3, succeeded: 0, failed: 3 });
+    const out = json(result) as { requested: number; saved: number; failed: number; rows: Array<Record<string, unknown>> };
+    expect(out).toMatchObject({ requested: 3, saved: 0, unverified: 0, noteFailed: 0, failed: 3 });
     expect(out.rows.map((row) => row.success)).toEqual([false, false, false]);
   });
 
@@ -520,7 +526,57 @@ describe("cw_bulk_update_tickets", () => {
     const result = await call("cw_bulk_update_tickets", { ids: [1, 2], operations: ownerChange, confirm: true });
 
     expect(result.isError).not.toBe(true);
-    expect(json(result)).toMatchObject({ requested: 2, succeeded: 2, failed: 0 });
+    expect(json(result)).toMatchObject({ requested: 2, saved: 2, unverified: 0, noteFailed: 0, failed: 0 });
+  });
+
+  it("counts a saved patch whose read back failed as saved and unverified, and still adds the note", async () => {
+    const tickets = { 1: fullTicket(1) };
+    const cw = fakeConnectWise(tickets, { failRead: [1] });
+
+    const result = await call("cw_bulk_update_tickets", {
+      ids: [1],
+      operations: ownerChange,
+      note: "Reassigned in the board review",
+      confirm: true,
+    });
+
+    const out = json(result) as { rows: Array<Record<string, unknown>> };
+    expect(out).toMatchObject({ requested: 1, saved: 1, unverified: 1, noteFailed: 0, failed: 0 });
+    expect(out.rows[0]).toMatchObject({ id: 1, success: true, verified: false, note: { added: true, id: 9000 } });
+    expect(String(out.rows[0].error)).toMatch(/patch was saved but the read back failed/);
+    expect(out.rows[0]).not.toHaveProperty("ticket");
+    // The patch reached ConnectWise, so this is not a tool error.
+    expect(result.isError).not.toBe(true);
+    expect((tickets[1].owner as { id: number }).id).toBe(31);
+    expect(cw.calls.filter((c) => c.path.endsWith("/notes"))).toHaveLength(1);
+  });
+
+  it("puts no ticket in both saved and failed across a mixed call", async () => {
+    // 1 is clean, 2 saves but cannot be read back, 3 saves but its note fails, 4 does not save.
+    const tickets = Object.fromEntries([1, 2, 3, 4].map((id) => [id, fullTicket(id)]));
+    fakeConnectWise(tickets, { failRead: [2], failNote: [3], failPatch: [4] });
+
+    const result = await call("cw_bulk_update_tickets", {
+      ids: [1, 2, 3, 4],
+      operations: ownerChange,
+      note: "Reassigned",
+      confirm: true,
+    });
+
+    const out = json(result) as { saved: number; failed: number; rows: Array<Record<string, unknown>> };
+    expect(out).toMatchObject({ requested: 4, saved: 3, unverified: 1, noteFailed: 1, failed: 1 });
+    expect(out.saved + out.failed).toBe(out.rows.length);
+    expect(out.rows.map((row) => row.success)).toEqual([true, true, true, false]);
+    expect(result.isError).not.toBe(true);
+  });
+
+  it("flags a tool error for a single ticket whose patch was not saved", async () => {
+    fakeConnectWise({ 1: fullTicket(1) }, { failPatch: [1] });
+
+    const result = await call("cw_bulk_update_tickets", { ids: [1], operations: ownerChange, confirm: true });
+
+    expect(result.isError).toBe(true);
+    expect(json(result)).toMatchObject({ requested: 1, saved: 0, failed: 1 });
   });
 
   it("does not add the note to a ticket whose patch failed", async () => {
@@ -554,7 +610,9 @@ describe("cw_bulk_update_tickets", () => {
 
     const row = (json(result) as { rows: Array<Record<string, unknown>> }).rows[0];
     expect(row).toMatchObject({ success: true, verified: false, mismatches: ["owner/id"] });
-    expect(result.isError).toBe(true);
+    // The patch was accepted, so the row is saved and unverified, and the call is not a tool error.
+    expect(json(result)).toMatchObject({ requested: 1, saved: 1, unverified: 1, failed: 0 });
+    expect(result.isError).not.toBe(true);
   });
 
   it("refuses an add or replace with no value before any request", async () => {
