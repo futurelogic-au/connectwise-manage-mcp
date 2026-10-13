@@ -117,7 +117,7 @@ function fakeConnectWise(state: FakeState) {
       const sheet = state.sheets[Number(match[1])];
       return sheet ? jsonResponse(sheet) : notFound();
     }
-    if ((match = path.match(/^\/time\/sheets\/(\d+)\/audits$/))) return list(state.audits ?? []);
+    if (/^\/time\/sheets\/\d+\/audits$/.test(path)) return list(state.audits ?? []);
     if ((match = path.match(/^\/time\/sheets\/(\d+)\/(approve|reject|reverse)$/)) && method === "POST") {
       const sheet = state.sheets[Number(match[1])];
       const action = match[2];
