@@ -39,6 +39,7 @@ import { registerTicketMergeTools } from "./tools/ticket-merge.js";
 import { registerCompanyTypeTools } from "./tools/company-types.js";
 import { registerAgreementExclusionTools } from "./tools/agreement-exclusions.js";
 import { registerExpenseTools } from "./tools/expenses.js";
+import { registerSetupTools } from "./tools/setup.js";
 
 export type { CwManageConfig };
 
@@ -186,6 +187,7 @@ export function createMcpServer(configOverride?: CwManageConfig): McpServer {
   registerCompanyTypeTools(server, client);
   registerAgreementExclusionTools(server, client);
   registerExpenseTools(server, client);
+  registerSetupTools(server, client);
 
   return server;
 }

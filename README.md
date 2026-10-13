@@ -164,6 +164,17 @@ needed.
 - `cw_list_priorities` — List ticket priorities
 - `cw_list_statuses` — List statuses for a board
 
+### Setup (read-only)
+These tools read the setup that decides where a service ticket lands and who owns it. There is no create, update or delete tool for any setup table.
+- `cw_get_board`: One service board, as the full record, with its auto-assign resources
+- `cw_list_board_teams` / `cw_get_board_team`: Board teams, each with its default flag, its team leader and its members named
+- `cw_list_board_statuses` / `cw_get_board_status`: Board statuses with the closed, inactive and escalation flags. The list reads all pages, in sort order
+- `cw_list_board_types` / `cw_get_board_type` / `cw_get_board_subtype`: Ticket types and subtypes on a board. A subtype lists the types it can be used with
+- `cw_list_workflow_rules` / `cw_get_workflow_rule`: Workflow rules, filtered by board or to active rules. The get returns every event with its condition and every action under it
+- `cw_list_email_connectors` / `cw_get_email_connector`: Email connectors with the board each files to, its default member and its overrides. The get returns the parsing styles and the mail-handling rules under each
+- `cw_list_slas` / `cw_get_sla`: SLAs. The get returns the per-priority targets
+- `cw_trace_ticket_routing`: Given a ticket id, shows why the ticket sits on its board and team with its owner. It returns the ticket's audit trail lines about the owner, the board's auto-assign setup, the ticket's team and the default team, the email connectors that file to the board, the board's active workflow rules with events and actions, and `candidates`: every piece of setup that names the ticket's owner. A candidate is setup that could have set the owner, not proof. Event conditions are returned as ConnectWise holds them and are not evaluated against the ticket. A section that cannot be read is named in `unread`
+
 ### Activities
 - `cw_search_activities` — Search activities
 - `cw_get_activity` — Get an activity by ID
