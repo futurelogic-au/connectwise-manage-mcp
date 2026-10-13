@@ -8,9 +8,9 @@ import { operationsMissingValue, ticketPatchOperationSchema } from "./ticket-lea
  * Time sheet tools (ConnectWise Time API, /time/sheets).
  *
  * A time sheet is one member's time for one Saturday to Friday period. These
- * tools find and read sheets, approve, reject and reverse them at tier one,
- * edit a time entry on an approved sheet through a guided reverse, edit and
- * approve again, and list the sheets that are missing. Approval feeds billing,
+ * tools find and read sheets, submit them, approve, reject and reverse them at
+ * tier one, edit a time entry on an approved sheet through a guided reverse,
+ * edit, submit and approve, and list the sheets that are missing. Approval feeds billing,
  * so every write needs confirm: true and is read back.
  */
 
@@ -29,6 +29,7 @@ export const TIER_ONE_APPROVAL_TYPE = "Tier1Update";
 
 const STATUS_APPROVED_TIER_ONE = "ApprovedByTierOne";
 const STATUS_REJECTED = "Rejected";
+const STATUS_OPEN = "Open";
 /** A sheet that has been submitted and waits for a tier one decision. */
 const SUBMITTED_STATUSES = ["PendingApproval", "ErrorsCorrected"];
 /** D21: a sheet in one of these statuses has not been submitted. */
@@ -335,7 +336,7 @@ async function readHolidays(client: CwManageClient, members: CwRecord[]): Promis
 // Status changes
 // ---------------------------------------------------------------------------
 
-type SheetAction = "approve" | "reject" | "reverse";
+type SheetAction = "submit" | "approve" | "reject" | "reverse";
 
 interface StatusChange {
   ok: boolean;
@@ -347,12 +348,16 @@ interface StatusChange {
 const statusOf = (sheet: CwRecord | null) => (typeof sheet?.status === "string" ? sheet.status : null);
 
 /** True when the status read back is the one this action should leave. */
-function landed(action: SheetAction, statusBefore: string | null, statusAfter: string | null): boolean {
+function landed(action: SheetAction, statusAfter: string | null): boolean {
+  if (action === "submit") return statusAfter !== null && SUBMITTED_STATUSES.includes(statusAfter);
   if (action === "approve") return statusAfter === STATUS_APPROVED_TIER_ONE;
   if (action === "reject") return statusAfter === STATUS_REJECTED;
-  // Reverse takes the approval off. The status it leaves is read back, not assumed.
-  return statusAfter !== null && statusAfter !== statusBefore && statusAfter !== STATUS_APPROVED_TIER_ONE;
+  // On the live server a reverse takes the approval off and un-submits the sheet: it reads Open.
+  return statusAfter === STATUS_OPEN;
 }
+
+/** A submit takes no body. Approve, reject and reverse take the tier one approval type. */
+const bodyFor = (action: SheetAction) => (action === "submit" ? {} : { approvalType: TIER_ONE_APPROVAL_TYPE });
 
 /** Send one tier one status change and read the sheet back. Never throws: a failure is returned. */
 async function changeSheetStatus(
@@ -362,13 +367,13 @@ async function changeSheetStatus(
   statusBefore: string | null,
 ): Promise<StatusChange> {
   try {
-    await client.post(`/time/sheets/${sheetId}/${action}`, { approvalType: TIER_ONE_APPROVAL_TYPE });
+    await client.post(`/time/sheets/${sheetId}/${action}`, bodyFor(action));
   } catch (err: unknown) {
     return { ok: false, statusBefore, statusAfter: statusBefore, error: errorMessage(err) };
   }
   try {
     const statusAfter = statusOf(await client.get<CwRecord>(`/time/sheets/${sheetId}`));
-    return landed(action, statusBefore, statusAfter)
+    return landed(action, statusAfter)
       ? { ok: true, statusBefore, statusAfter }
       : {
           ok: false,
@@ -387,12 +392,21 @@ async function changeSheetStatus(
 }
 
 const ALLOWED_FROM: Record<SheetAction, string[]> = {
+  submit: NOT_SUBMITTED_STATUSES,
   approve: SUBMITTED_STATUSES,
   reject: SUBMITTED_STATUSES,
   reverse: [STATUS_APPROVED_TIER_ONE],
 };
 
-const PAST_TENSE: Record<SheetAction, string> = { approve: "approved", reject: "rejected", reverse: "reversed" };
+/** ConnectWise's refusal of a sheet reject when no time entry on the sheet is rejected. */
+const ENTRIES_NOT_REJECTED = /reject the incorrect time entries/i;
+
+const PAST_TENSE: Record<SheetAction, string> = {
+  submit: "submitted",
+  approve: "approved",
+  reject: "rejected",
+  reverse: "reversed",
+};
 
 /** The shared handler for approve, reject and reverse: guard, plan, write, read back. */
 async function runSheetAction(
@@ -423,7 +437,7 @@ async function runSheetAction(
         jsonText({
           saved: false,
           message: `No write was made. Pass confirm: true to ${action} this time sheet.`,
-          planned: { call: `POST /time/sheets/${args.id}/${action}`, approvalType: TIER_ONE_APPROVAL_TYPE },
+          planned: { call: `POST /time/sheets/${args.id}/${action}`, ...bodyFor(action) },
           ...reason,
           timeSheet: sheet,
         }),
@@ -445,11 +459,18 @@ async function runSheetAction(
         saved: change.error === undefined || change.statusAfter !== statusBefore,
         verified: change.ok,
         action,
-        approvalType: TIER_ONE_APPROVAL_TYPE,
+        ...bodyFor(action),
         statusBefore: change.statusBefore,
         statusAfter: change.statusAfter,
         ...reason,
         ...(change.error ? { error: change.error } : {}),
+        ...(action === "reject" && change.error && ENTRIES_NOT_REJECTED.test(change.error)
+          ? {
+              refusal: "entries-not-rejected",
+              message:
+                "ConnectWise rejects a time sheet only after at least one of its time entries is rejected. The API cannot reject a time entry, so reject the incorrect entries in Manage first, then run this again. Nothing was changed.",
+            }
+          : {}),
         timeSheet: after ? toLeanTimeSheet(after) : sheet,
       }),
     ],
@@ -568,8 +589,19 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
   );
 
   server.tool(
+    "cw_submit_time_sheet",
+    "Submit one time sheet for approval (POST /time/sheets/{id}/submit). Only a sheet that is Open or Rejected is submitted. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good submit reads PendingApproval. The submit is recorded against the member whose keys make the call, which may not be the member whose sheet it is. A reverse leaves a sheet Open, so a reversed sheet is submitted again with this tool before it can be approved.",
+    {
+      id: z.number().int().positive().describe("Time sheet ID"),
+      confirm: z.boolean().optional().describe("Must be true for the submit to happen. Omitted or false makes no write"),
+    },
+    TIME_SHEET_WRITE,
+    async ({ id, confirm }) => runSheetAction(client, "submit", { id, confirm }),
+  );
+
+  server.tool(
     "cw_approve_time_sheet",
-    `Approve one time sheet at tier one (POST /time/sheets/{id}/approve with approvalType ${TIER_ONE_APPROVAL_TYPE}). The approval is recorded against the member whose keys make the call. Only a submitted sheet (PendingApproval or ErrorsCorrected) is approved. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good approval reads ApprovedByTierOne. Approval feeds billing. Tier one only: this tool never sends another approvalType.`,
+    `Approve one time sheet at tier one (POST /time/sheets/{id}/approve with approvalType ${TIER_ONE_APPROVAL_TYPE}). The approval is recorded against the member whose keys make the call. Only a submitted sheet (PendingApproval or ErrorsCorrected) is approved: submit an Open or Rejected sheet first with cw_submit_time_sheet. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good approval reads ApprovedByTierOne. Approval feeds billing. Tier one only: this tool never sends another approvalType.`,
     {
       id: z.number().int().positive().describe("Time sheet ID"),
       confirm: z.boolean().optional().describe("Must be true for the approval to happen. Omitted or false makes no write"),
@@ -580,7 +612,7 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
 
   server.tool(
     "cw_reject_time_sheet",
-    `Reject one submitted time sheet at tier one (POST /time/sheets/{id}/reject with approvalType ${TIER_ONE_APPROVAL_TYPE}). Only a submitted sheet (PendingApproval or ErrorsCorrected) is rejected. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good reject reads Rejected. ConnectWise's reject call takes no reason, so the reason is returned in the result for the caller's record and is not stored on the sheet.`,
+    `Reject one submitted time sheet at tier one (POST /time/sheets/{id}/reject with approvalType ${TIER_ONE_APPROVAL_TYPE}). Only a submitted sheet (PendingApproval or ErrorsCorrected) is rejected. ConnectWise rejects a sheet only after at least one of its time entries is rejected, and the API has no way to reject a time entry (a patch of an entry's status is accepted and ignored). So reject the incorrect time entries in Manage first, then call this tool. A sheet with no rejected entry is refused with reason entries-not-rejected and nothing is changed. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good reject reads Rejected. ConnectWise's reject call takes no reason, so the reason is returned in the result for the caller's record and is not stored on the sheet.`,
     {
       id: z.number().int().positive().describe("Time sheet ID"),
       reason: z
@@ -597,7 +629,7 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
 
   server.tool(
     "cw_reverse_time_sheet",
-    `Reverse a tier one approval on one time sheet (POST /time/sheets/{id}/reverse with approvalType ${TIER_ONE_APPROVAL_TYPE}), so its time entries can be changed again. Only a sheet that reads ApprovedByTierOne is reversed. Requires confirm: true and a reason. Without confirm: true nothing is written and the plan is returned. After the write the sheet is read back, and the status it now holds is returned. ConnectWise's reverse call takes no reason, so the reason is returned in the result and is not stored on the sheet. To change one time entry on an approved sheet and approve the sheet again in one call, use cw_edit_approved_time_entry.`,
+    `Reverse a tier one approval on one time sheet (POST /time/sheets/{id}/reverse with approvalType ${TIER_ONE_APPROVAL_TYPE}), so its time entries can be changed again. Only a sheet that reads ApprovedByTierOne is reversed. Requires confirm: true and a reason. Without confirm: true nothing is written and the plan is returned. After the write the sheet is read back. A reverse takes the approval off and un-submits the sheet, so a good reverse reads Open, and the sheet's time entries read Open again. To approve it again, submit it first with cw_submit_time_sheet. ConnectWise's reverse call takes no reason, so the reason is returned in the result and is not stored on the sheet. To change one time entry on an approved sheet and approve the sheet again in one call, use cw_edit_approved_time_entry. To add time to an approved sheet: reverse it, create the entry, submit it and approve it.`,
     {
       id: z.number().int().positive().describe("Time sheet ID"),
       reason: z.string().trim().min(3).describe("Why the approval is reversed. Returned in the result"),
@@ -609,7 +641,7 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
 
   server.tool(
     "cw_edit_approved_time_entry",
-    "Change one time entry on a time sheet that is approved at tier one, in three steps, each read back: reverse the sheet, patch the time entry, approve the sheet again. Use it only for an entry whose sheet reads ApprovedByTierOne: for any other entry use cw_update_time_entry. Requires confirm: true and a reason. Without confirm: true nothing is written and the plan is returned with the entry's current values. The result lists every field of the time entry that changed, read before the first step and after the last: field, from and to (shown as a change log shows them: a reference by its name, notes cut at 200 characters), and the raw before and after values. inPlan says whether the field was in the operations. unplannedChanges names every field ConnectWise changed by itself, and plannedNotChanged names every field in the operations that did not change. The time sheet's own changes are listed the same way. If the patch fails, the sheet is approved again so it is left as it was found, and the result says so. A patch on id, member or timeSheet is refused.",
+    "Change one time entry on a time sheet that is approved at tier one, in four steps, each read back: reverse the sheet (which leaves it Open), patch the time entry, submit the sheet, approve the sheet again. Use it only for an entry whose sheet reads ApprovedByTierOne: for any other entry use cw_update_time_entry. Requires confirm: true and a reason. Without confirm: true nothing is written and the plan is returned with the entry's current values. The result lists every field of the time entry that changed, read before the first step and after the last: field, from and to (shown as a change log shows them: a reference by its name, notes cut at 200 characters), and the raw before and after values. inPlan says whether the field was in the operations. unplannedChanges names every field ConnectWise changed by itself, and plannedNotChanged names every field in the operations that did not change. The time sheet's own changes are listed the same way. If the patch fails, the sheet is still submitted and approved again so it is left as it was found, and the result says so. The submit and both status changes are recorded against the member whose keys make the call. A patch on id, member or timeSheet is refused.",
     {
       timeEntryId: z.number().int().positive().describe("Time entry ID"),
       operations: z
@@ -675,13 +707,14 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
           content: [
             jsonText({
               saved: false,
-              message: "No write was made. Pass confirm: true to reverse the sheet, change the entry and approve the sheet again.",
+              message: "No write was made. Pass confirm: true to reverse the sheet, change the entry, submit the sheet and approve it again.",
               timeEntryId,
               reason,
               planned: {
                 steps: [
                   `POST /time/sheets/${sheetId}/reverse`,
                   `PATCH /time/entries/${timeEntryId}`,
+                  `POST /time/sheets/${sheetId}/submit`,
                   `POST /time/sheets/${sheetId}/approve`,
                 ],
                 operations,
@@ -715,7 +748,7 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
           : [];
         const changedFields = changes.map((change) => change.field);
         const statusAfter = statusOf(sheetAfter);
-        const completed = steps.length === 3 && steps.every((step) => step.ok === true);
+        const completed = steps.length === 4 && steps.every((step) => step.ok === true);
         const verified = completed && unread.length === 0 && statusAfter === STATUS_APPROVED_TIER_ONE;
         return {
           content: [
@@ -759,21 +792,31 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
       }
       steps.push({ step: "edit", ok: patchError === undefined, ...(patchError ? { error: patchError } : {}) });
 
-      // Step 3: approve the sheet again. This runs after a failed patch too, so the sheet is left as it was found.
-      const approve = await changeSheetStatus(client, sheetId, "approve", reverse.statusAfter);
-      steps.push({ step: "approve", ...approve });
+      // Steps 3 and 4: submit the sheet and approve it again. These run after a failed patch too,
+      // so the sheet is left as it was found.
+      const submit = await changeSheetStatus(client, sheetId, "submit", reverse.statusAfter);
+      steps.push({ step: "submit", ...submit });
+      let restored = false;
+      if (submit.ok) {
+        const approve = await changeSheetStatus(client, sheetId, "approve", submit.statusAfter);
+        steps.push({ step: "approve", ...approve });
+        restored = approve.ok;
+      }
+      const leftAs = submit.ok
+        ? "It is left submitted and not approved: read its status below and approve it before billing runs."
+        : "It is left reversed and not submitted: read its status below, then submit and approve it before billing runs.";
 
       if (patchError !== undefined) {
         return finish(
-          approve.ok
-            ? "The time entry was not changed: ConnectWise refused the patch. The time sheet was approved again, so it is as it was found."
-            : "The time entry was not changed, and the time sheet could NOT be approved again. It is left reversed: read its status below and approve it before billing runs.",
+          restored
+            ? "The time entry was not changed: ConnectWise refused the patch. The time sheet was submitted and approved again, so it is as it was found."
+            : `The time entry was not changed, and the time sheet could NOT be approved again. ${leftAs}`,
         );
       }
       return finish(
-        approve.ok
-          ? "The time sheet was reversed, the time entry was changed and the time sheet was approved again."
-          : "The time entry was changed, but the time sheet could NOT be approved again. It is left reversed: read its status below and approve it before billing runs.",
+        restored
+          ? "The time sheet was reversed, the time entry was changed, and the time sheet was submitted and approved again."
+          : `The time entry was changed, but the time sheet could NOT be approved again. ${leftAs}`,
       );
     },
   );

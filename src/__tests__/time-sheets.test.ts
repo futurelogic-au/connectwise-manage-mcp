@@ -84,9 +84,7 @@ interface FakeState {
   calendars?: Rec[];
   /** Holiday dates by holiday list id. */
   holidays?: Record<number, string[]>;
-  /** The status a reverse leaves. */
-  reversedStatus?: string;
-  /** Actions (approve, reject, reverse) that answer 400. */
+  /** Actions (submit, approve, reject, reverse) that answer 400. */
   failAction?: string[];
   /** Actions that answer 200 and leave the status as it was. */
   ignoreAction?: string[];
@@ -118,7 +116,7 @@ function fakeConnectWise(state: FakeState) {
       return sheet ? jsonResponse(sheet) : notFound();
     }
     if (/^\/time\/sheets\/\d+\/audits$/.test(path)) return list(state.audits ?? []);
-    if ((match = path.match(/^\/time\/sheets\/(\d+)\/(approve|reject|reverse)$/)) && method === "POST") {
+    if ((match = path.match(/^\/time\/sheets\/(\d+)\/(submit|approve|reject|reverse)$/)) && method === "POST") {
       const sheet = state.sheets[Number(match[1])];
       const action = match[2];
       if (!sheet) return notFound();
@@ -128,7 +126,9 @@ function fakeConnectWise(state: FakeState) {
       if (!state.ignoreAction?.includes(action)) {
         if (action === "approve") Object.assign(sheet, { status: "ApprovedByTierOne" }, state.sheetSideEffects ?? {});
         if (action === "reject") sheet.status = "Rejected";
-        if (action === "reverse") sheet.status = state.reversedStatus ?? "PendingApproval";
+        // Seen live: a reverse un-submits the sheet, and a submit takes no body.
+        if (action === "reverse") sheet.status = "Open";
+        if (action === "submit") sheet.status = "PendingApproval";
       }
       return jsonResponse({ success: true });
     }
@@ -207,7 +207,7 @@ describe("time sheet tools, registration", () => {
       expect(find(name).annotations, name).toMatchObject({ readOnlyHint: true });
       expect(find(name).inputSchema.properties, name).not.toHaveProperty("confirm");
     }
-    for (const name of ["cw_approve_time_sheet", "cw_reject_time_sheet", "cw_reverse_time_sheet", "cw_edit_approved_time_entry"]) {
+    for (const name of ["cw_submit_time_sheet", "cw_approve_time_sheet", "cw_reject_time_sheet", "cw_reverse_time_sheet", "cw_edit_approved_time_entry"]) {
       expect(find(name), name).toBeDefined();
       expect(find(name).annotations, name).toMatchObject({ readOnlyHint: false, destructiveHint: true });
       expect(find(name).inputSchema.properties, name).toHaveProperty("confirm");
@@ -353,6 +353,55 @@ describe("cw_approve_time_sheet (D19)", () => {
   });
 });
 
+describe("cw_submit_time_sheet", () => {
+  it("writes nothing without confirm: true and returns the plan", async () => {
+    const cw = fakeConnectWise({ sheets: { 900: sheet(900, { status: "Open" }) } });
+    const result = await call("cw_submit_time_sheet", { id: 900 });
+    expect(result.isError).toBe(true);
+    const out = json(result) as { planned: Rec };
+    expect(out).toMatchObject({ saved: false, timeSheet: { id: 900, status: "Open" } });
+    // A submit has no approval tier, so the plan names none.
+    expect(out.planned).toEqual({ call: "POST /time/sheets/900/submit" });
+    expect(writes(cw.calls)).toEqual([]);
+  });
+
+  it.each(["Open", "Rejected"])("submits a sheet that is %s with an empty body and reads PendingApproval back", async (status) => {
+    const cw = fakeConnectWise({ sheets: { 900: sheet(900, { status }) } });
+    const result = await call("cw_submit_time_sheet", { id: 900, confirm: true });
+    expect(result.isError).not.toBe(true);
+    const out = json(result);
+    expect(out).toMatchObject({ saved: true, verified: true, action: "submit", statusBefore: status, statusAfter: "PendingApproval" });
+    expect(out).not.toHaveProperty("approvalType");
+    expect(sent(cw.calls)).toEqual(["POST /time/sheets/900/submit"]);
+    expect(writes(cw.calls)[0].body).toEqual({});
+  });
+
+  it.each(["PendingApproval", "ApprovedByTierOne", "Billed"])("refuses to submit a sheet that is %s", async (status) => {
+    const cw = fakeConnectWise({ sheets: { 900: sheet(900, { status }) } });
+    const result = await call("cw_submit_time_sheet", { id: 900, confirm: true });
+    expect(result.isError).toBe(true);
+    expect(String(json(result).message)).toContain(`is ${status}, so it is not submitted`);
+    expect(writes(cw.calls)).toEqual([]);
+  });
+
+  it("does not call a sheet submitted when the status did not move", async () => {
+    fakeConnectWise({ sheets: { 900: sheet(900, { status: "Open" }) }, ignoreAction: ["submit"] });
+    const result = await call("cw_submit_time_sheet", { id: 900, confirm: true });
+    expect(result.isError).toBe(true);
+    expect(json(result)).toMatchObject({ saved: false, verified: false, statusAfter: "Open" });
+  });
+
+  it("takes an approved sheet through reverse, submit and approve, as the live server needs", async () => {
+    const cw = fakeConnectWise({ sheets: { 900: sheet(900, { status: "ApprovedByTierOne" }) } });
+    expect(json(await call("cw_reverse_time_sheet", { id: 900, reason: "Add a missed entry", confirm: true }))).toMatchObject({ statusAfter: "Open" });
+    // Straight after a reverse the sheet is Open, so an approve is refused until it is submitted.
+    expect((await call("cw_approve_time_sheet", { id: 900, confirm: true })).isError).toBe(true);
+    expect(json(await call("cw_submit_time_sheet", { id: 900, confirm: true }))).toMatchObject({ statusAfter: "PendingApproval" });
+    expect(json(await call("cw_approve_time_sheet", { id: 900, confirm: true }))).toMatchObject({ statusAfter: "ApprovedByTierOne" });
+    expect(sent(cw.calls)).toEqual(["POST /time/sheets/900/reverse", "POST /time/sheets/900/submit", "POST /time/sheets/900/approve"]);
+  });
+});
+
 describe("cw_reject_time_sheet and cw_reverse_time_sheet (D20)", () => {
   it("rejects a submitted sheet and returns the reason it was given", async () => {
     const cw = fakeConnectWise({ sheets: { 900: sheet(900) } });
@@ -368,6 +417,42 @@ describe("cw_reject_time_sheet and cw_reverse_time_sheet (D20)", () => {
     expect(sent(cw.calls)).toEqual(["POST /time/sheets/900/reject"]);
     // ConnectWise's reject call takes no reason, so none is sent.
     expect(writes(cw.calls)[0].body).toEqual({ approvalType: "Tier1Update" });
+  });
+
+  it("names the refusal ConnectWise gives when no time entry on the sheet is rejected, as seen live", async () => {
+    // Live on 13/10/2026: 400 with this message, on a submitted sheet whose entries were all unrejected.
+    const refusal = {
+      code: "InvalidObject",
+      message: "timeSheet object is invalid",
+      errors: [
+        {
+          code: "InvalidObject",
+          message: "Period 42 / Stephan Jenner cannot be rejected: You must reject the incorrect time entries before rejecting the time sheet.",
+          resource: "timeSheet",
+          field: "id",
+        },
+      ],
+    };
+    const state = sheet(900);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init: RequestInit = {}) =>
+        init.method === "POST" ? jsonResponse(refusal, 400) : jsonResponse(state),
+      ),
+    );
+
+    const result = await call("cw_reject_time_sheet", { id: 900, reason: "Friday has no entries", confirm: true });
+
+    expect(result.isError).toBe(true);
+    const out = json(result);
+    expect(out).toMatchObject({ saved: false, verified: false, refusal: "entries-not-rejected", statusAfter: "PendingApproval" });
+    expect(String(out.message)).toMatch(/reject the incorrect entries in Manage first/);
+  });
+
+  it("gives no entries-not-rejected reason for another refusal, or on another action", async () => {
+    fakeConnectWise({ sheets: { 900: sheet(900) }, failAction: ["reject", "approve"] });
+    expect(json(await call("cw_reject_time_sheet", { id: 900, confirm: true }))).not.toHaveProperty("refusal");
+    expect(json(await call("cw_approve_time_sheet", { id: 900, confirm: true }))).not.toHaveProperty("refusal");
   });
 
   it("writes nothing on a reject or a reverse without confirm: true", async () => {
@@ -388,7 +473,7 @@ describe("cw_reject_time_sheet and cw_reverse_time_sheet (D20)", () => {
     expect(writes(cw.calls)).toEqual([]);
   });
 
-  it("reverses an approved sheet and returns the status it now holds", async () => {
+  it("reverses an approved sheet, which leaves it Open", async () => {
     const cw = fakeConnectWise({ sheets: { 900: sheet(900, { status: "ApprovedByTierOne" }) } });
     const result = await call("cw_reverse_time_sheet", { id: 900, reason: "Wrong work type on one entry", confirm: true });
     expect(result.isError).not.toBe(true);
@@ -396,7 +481,7 @@ describe("cw_reject_time_sheet and cw_reverse_time_sheet (D20)", () => {
       verified: true,
       action: "reverse",
       statusBefore: "ApprovedByTierOne",
-      statusAfter: "PendingApproval",
+      statusAfter: "Open",
       reason: "Wrong work type on one entry",
     });
     expect(sent(cw.calls)).toEqual(["POST /time/sheets/900/reverse"]);
@@ -448,7 +533,7 @@ describe("cw_edit_approved_time_entry (D20 guided flow)", () => {
       timeEntryId: 1,
       reason: "Internal work billed by mistake",
       planned: {
-        steps: ["POST /time/sheets/900/reverse", "PATCH /time/entries/1", "POST /time/sheets/900/approve"],
+        steps: ["POST /time/sheets/900/reverse", "PATCH /time/entries/1", "POST /time/sheets/900/submit", "POST /time/sheets/900/approve"],
         operations: args.operations,
       },
       current: { billableOption: { value: "Billable", shown: "Billable" } },
@@ -457,7 +542,7 @@ describe("cw_edit_approved_time_entry (D20 guided flow)", () => {
     expect(writes(cw.calls)).toEqual([]);
   });
 
-  it("reverses, edits and approves again, and returns before and after for each changed field", async () => {
+  it("reverses, edits, submits and approves again, and returns before and after for each changed field", async () => {
     const cw = fakeConnectWise(approved());
     const result = await call("cw_edit_approved_time_entry", { ...args, confirm: true });
     expect(result.isError).not.toBe(true);
@@ -467,8 +552,9 @@ describe("cw_edit_approved_time_entry (D20 guided flow)", () => {
       timeEntryId: 1,
       reason: "Internal work billed by mistake",
       steps: [
-        { step: "reverse", ok: true, statusBefore: "ApprovedByTierOne", statusAfter: "PendingApproval" },
+        { step: "reverse", ok: true, statusBefore: "ApprovedByTierOne", statusAfter: "Open" },
         { step: "edit", ok: true },
+        { step: "submit", ok: true, statusBefore: "Open", statusAfter: "PendingApproval" },
         { step: "approve", ok: true, statusBefore: "PendingApproval", statusAfter: "ApprovedByTierOne" },
       ],
       changes: [{ field: "billableOption", from: "Billable", to: "NoCharge", before: "Billable", after: "NoCharge", inPlan: true }],
@@ -479,9 +565,17 @@ describe("cw_edit_approved_time_entry (D20 guided flow)", () => {
     expect(sent(cw.calls)).toEqual([
       "POST /time/sheets/900/reverse",
       "PATCH /time/entries/1",
+      "POST /time/sheets/900/submit",
       "POST /time/sheets/900/approve",
     ]);
     expect(writes(cw.calls)[1].body).toEqual(args.operations);
+    // A submit takes no body. Reverse and approve take the tier one approval type.
+    expect(writes(cw.calls).map((entry) => entry.body)).toEqual([
+      { approvalType: "Tier1Update" },
+      args.operations,
+      {},
+      { approvalType: "Tier1Update" },
+    ]);
   });
 
   it("reports a field ConnectWise changed by itself as an unplanned change", async () => {
@@ -533,7 +627,7 @@ describe("cw_edit_approved_time_entry (D20 guided flow)", () => {
     expect(json(result)).toMatchObject({ current: { workType: { value: { id: 28, name: "> Business Days (830-530)" }, shown: "> Business Days (830-530)" } } });
   });
 
-  it("approves the sheet again when ConnectWise refuses the patch, and says the entry was not changed", async () => {
+  it("submits and approves the sheet again when ConnectWise refuses the patch, and says the entry was not changed", async () => {
     const cw = fakeConnectWise(approved({ failPatch: true }));
     const result = await call("cw_edit_approved_time_entry", { ...args, confirm: true });
     expect(result.isError).toBe(true);
@@ -541,9 +635,15 @@ describe("cw_edit_approved_time_entry (D20 guided flow)", () => {
     expect(out).toMatchObject({ completed: false, verified: false, changes: [], timeSheet: { statusAfter: "ApprovedByTierOne" } });
     expect(out.steps[1]).toMatchObject({ step: "edit", ok: false });
     expect(String(out.steps[1].error)).toMatch(/PATCH \/time\/entries\/1 returned 400/);
-    expect(out.steps[2]).toMatchObject({ step: "approve", ok: true });
-    expect(out.message).toMatch(/not changed.*approved again, so it is as it was found/);
-    expect(sent(cw.calls)).toEqual(["POST /time/sheets/900/reverse", "PATCH /time/entries/1", "POST /time/sheets/900/approve"]);
+    expect(out.steps[2]).toMatchObject({ step: "submit", ok: true });
+    expect(out.steps[3]).toMatchObject({ step: "approve", ok: true });
+    expect(out.message).toMatch(/not changed.*submitted and approved again, so it is as it was found/);
+    expect(sent(cw.calls)).toEqual([
+      "POST /time/sheets/900/reverse",
+      "PATCH /time/entries/1",
+      "POST /time/sheets/900/submit",
+      "POST /time/sheets/900/approve",
+    ]);
     expect(cw.state.entries![1].billableOption).toBe("Billable");
   });
 
@@ -566,7 +666,23 @@ describe("cw_edit_approved_time_entry (D20 guided flow)", () => {
       changes: [{ field: "billableOption", to: "NoCharge" }],
       timeSheet: { statusBefore: "ApprovedByTierOne", statusAfter: "PendingApproval" },
     });
-    expect(out.message).toMatch(/could NOT be approved again\. It is left reversed/);
+    expect(out.message).toMatch(/could NOT be approved again\. It is left submitted and not approved/);
+  });
+
+  it("says the sheet is left reversed when the submit does not go through, and does not try to approve", async () => {
+    const cw = fakeConnectWise(approved({ failAction: ["submit"] }));
+    const result = await call("cw_edit_approved_time_entry", { ...args, confirm: true });
+    expect(result.isError).toBe(true);
+    const out = json(result) as { message: string; steps: Rec[] };
+    expect(out).toMatchObject({
+      completed: false,
+      verified: false,
+      changes: [{ field: "billableOption", to: "NoCharge" }],
+      timeSheet: { statusBefore: "ApprovedByTierOne", statusAfter: "Open" },
+    });
+    expect(out.steps.map((step) => step.step)).toEqual(["reverse", "edit", "submit"]);
+    expect(out.message).toMatch(/left reversed and not submitted/);
+    expect(sent(cw.calls)).toEqual(["POST /time/sheets/900/reverse", "PATCH /time/entries/1", "POST /time/sheets/900/submit"]);
   });
 
   it("refuses an entry whose sheet is not approved, and points to the plain update tool", async () => {

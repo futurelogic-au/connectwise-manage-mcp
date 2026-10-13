@@ -143,6 +143,19 @@ needed.
 - `cw_update_time_entry` — Correct a time entry (JSON Patch on `PATCH /time/entries/{id}`). Use this to fix `actualHours` when a metered agreement rounds to 0.25.
 - `cw_delete_time_entry` — Delete a time entry (`DELETE /time/entries/{id}`). Manage rejects deletes of entries that are already billed.
 
+### Time Sheets
+A time sheet is one member's time for one Saturday to Friday period (`/time/sheets`). Approval feeds billing, so every write needs `confirm: true` and is read back. Approvals are tier one only, recorded against the member whose keys make the call.
+- `cw_search_time_sheets`: Search time sheets, lean. Filter by member, status or period start
+- `cw_get_time_sheet`: One time sheet with its audit trail and its time entries
+- `cw_submit_time_sheet`: Submit an Open or Rejected sheet. A good submit reads `PendingApproval`
+- `cw_approve_time_sheet`: Approve a submitted sheet at tier one. A good approval reads `ApprovedByTierOne`
+- `cw_reject_time_sheet`: Reject a submitted sheet. ConnectWise allows it only after at least one time entry on the sheet is rejected, and the API cannot reject a time entry, so reject the incorrect entries in Manage first
+- `cw_reverse_time_sheet`: Reverse a tier one approval. Needs a `reason`. A reverse un-submits the sheet: it reads `Open`
+- `cw_edit_approved_time_entry`: Change one time entry on an approved sheet in four steps, each read back: reverse, patch the entry, submit, approve. Needs a `reason`. Returns every field of the time entry that changed, with `from` and `to` as a change log shows them and the raw `before` and `after` values. `unplannedChanges` names the fields ConnectWise changed by itself
+- `cw_list_missing_time_sheets`: The sheets that are Open or Rejected after 10am Perth time on the first business day after the period, on each member's own ConnectWise holiday list. Active members only. `excludeMembers` leaves members out; none is left out by default. `now` takes a Perth local time (`2026-10-13T11:00`) to judge another moment
+
+To add time to an approved sheet: reverse it, create the entry, submit it and approve it. ConnectWise takes new time only on a sheet that is Open.
+
 ### Schedule Entries
 - `cw_search_schedule_entries` — Search booked resource time
 - `cw_list_schedule_types` — List schedule types (Service, Project, Sales, Meeting)
