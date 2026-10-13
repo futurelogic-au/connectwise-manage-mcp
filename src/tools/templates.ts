@@ -18,8 +18,9 @@ import {
  * back to its template.
  *
  * The API does not return a template's recurrence (how often it runs, or when
- * it ends), so there is no tool here to stop a template recurring. No tool here
- * calls /service/templates/{id}/generate.
+ * it ends), so no tool here can stop a template recurring and leave the record
+ * in place. The way to stop one is to retire it: delete it with the retire
+ * flag. No tool here calls /service/templates/{id}/generate.
  */
 
 const TEMPLATE_READ_ONLY = { readOnlyHint: true };
@@ -100,12 +101,14 @@ export function daysAgoIso(days: number, now: Date = new Date()): string {
 interface TemplateUsage {
   recentTicketCount: number;
   recentTickets: CwRecord[];
+  /** Tickets the template made that are still open, whenever it made them. */
+  openTickets: CwRecord[];
   pendingBookings: CwRecord[];
 }
 
 /**
  * What a template has made: the tickets it generated inside the guard window,
- * and the bookings it has made that are not done yet.
+ * the tickets it made that are still open, and its bookings that are not done.
  */
 async function readTemplateUsage(client: CwManageClient, id: number, now: Date): Promise<TemplateUsage> {
   const since = daysAgoIso(TEMPLATE_DELETE_GUARD_DAYS, now);
@@ -113,6 +116,11 @@ async function readTemplateUsage(client: CwManageClient, id: number, now: Date):
     conditions: `enteredBy='template${id}' and dateEntered>=[${since}]`,
     orderBy: "id desc",
     fields: "id,summary,closedFlag,_info/dateEntered",
+  });
+  const open = await fetchAllPages<CwRecord>(client, "/service/tickets", {
+    conditions: `enteredBy='template${id}' and closedFlag=false`,
+    orderBy: "id desc",
+    fields: "id,summary,status/name,owner/identifier,_info/dateEntered",
   });
   const bookings = await fetchAllPages<CwRecord>(client, "/schedule/entries", {
     conditions: `type/id=${SR_TEMPLATE_SCHEDULE_TYPE} and objectId=${id} and doneFlag=false`,
@@ -125,6 +133,13 @@ async function readTemplateUsage(client: CwManageClient, id: number, now: Date):
       id: ticket.id ?? null,
       summary: ticket.summary ?? null,
       closedFlag: ticket.closedFlag ?? null,
+      dateEntered: asRecord(ticket._info)?.dateEntered ?? null,
+    })),
+    openTickets: open.map((ticket) => ({
+      id: ticket.id ?? null,
+      summary: ticket.summary ?? null,
+      status: asRecord(ticket.status)?.name ?? null,
+      owner: asRecord(ticket.owner)?.identifier ?? null,
       dateEntered: asRecord(ticket._info)?.dateEntered ?? null,
     })),
     pendingBookings: bookings.map((booking) => ({
@@ -180,7 +195,7 @@ export function registerTemplateTools(server: McpServer, client: CwManageClient)
 
   server.tool(
     "cw_get_service_template",
-    `Get one service ticket template as the full record (GET /service/templates/{id}), with what it has made: the tickets it generated in the last ${TEMPLATE_DELETE_GUARD_DAYS} days and the bookings it has made that are not done yet. The API does not return a template's recurrence. Read-only.`,
+    `Get one service ticket template as the full record (GET /service/templates/{id}), with what it has made: the tickets it generated in the last ${TEMPLATE_DELETE_GUARD_DAYS} days, the tickets it made that are still open, and the bookings it has made that are not done yet. The API does not return a template's recurrence. Read-only.`,
     { id: z.number().int().positive().describe("Service template ID") },
     TEMPLATE_READ_ONLY,
     async ({ id }) => {
@@ -274,7 +289,7 @@ export function registerTemplateTools(server: McpServer, client: CwManageClient)
 
   server.tool(
     "cw_update_service_template",
-    "Update one service ticket template using JSON Patch operations (PATCH /service/templates/{id}). Requires confirm: true. Without it nothing is written and the planned change is returned with the template's current values. After the write the template is read back and the response reports whether the fresh read holds the values that were sent. The change applies to tickets the template generates from now on, not to tickets it has already made. This tool does not change a template's recurrence, which the API does not return.",
+    "Update one service ticket template using JSON Patch operations (PATCH /service/templates/{id}). Requires confirm: true. Without it nothing is written and the planned change is returned with the template's current values. After the write the template is read back and the response reports whether the fresh read holds the values that were sent. The change applies to tickets the template generates from now on, not to tickets it has already made. This tool does not change a template's recurrence, which the API does not return: to stop a template recurring, retire it with cw_delete_service_template.",
     {
       id: z.number().int().positive().describe("Service template ID"),
       operations: z
@@ -347,7 +362,7 @@ export function registerTemplateTools(server: McpServer, client: CwManageClient)
 
   server.tool(
     "cw_delete_service_template",
-    `Delete one service ticket template (DELETE /service/templates/{id}). Requires confirm: true, a reason, and noteTicketId: the service ticket where the delete is recorded as an internal note. A template that generated a ticket in the last ${TEMPLATE_DELETE_GUARD_DAYS} days is refused, and so is a template with a booking that is not done yet. Without confirm: true nothing is written and the plan is returned. After the delete the tool adds the internal note naming the template and the reason, then reads the template back (expecting it gone) and the note back. Tickets the template already made are not touched.`,
+    `Delete one service ticket template (DELETE /service/templates/{id}). Requires confirm: true, a reason, and noteTicketId: the service ticket where the delete is recorded as an internal note. A template that generated a ticket in the last ${TEMPLATE_DELETE_GUARD_DAYS} days is refused, and so is a template with a booking that is not done yet, unless retire: true is passed. Retire is the way to stop an active template recurring, because the API holds no recurrence to end: with retire: true, confirm: true and a reason, an active template is deleted. The plan always lists the template's forward work: the tickets it made that are still open and its bookings that are not done. Without confirm: true nothing is written and the plan is returned. After the delete the tool adds the internal note naming the template and the reason, then reads the template back (expecting it gone) and the note back. The tool never closes a ticket or removes a booking: after a retire it returns them in followUp, and each one is shown to the user before any write.`,
     {
       id: z.number().int().positive().describe("Service template ID"),
       reason: z.string().trim().min(3).describe("Why the template is being deleted. Written into the ticket note"),
@@ -356,28 +371,40 @@ export function registerTemplateTools(server: McpServer, client: CwManageClient)
         .int()
         .positive()
         .describe("Service ticket that gets the internal note recording the delete"),
+      retire: z
+        .boolean()
+        .optional()
+        .describe(
+          `Must be true to delete a template that generated a ticket in the last ${TEMPLATE_DELETE_GUARD_DAYS} days or has a booking that is not done. Omitted or false keeps that guard`,
+        ),
       confirm: z
         .boolean()
         .optional()
         .describe("Must be true for the delete to happen. Omitted or false makes no write"),
     },
     TEMPLATE_WRITE,
-    async ({ id, reason, noteTicketId, confirm }) => {
+    async ({ id, reason, noteTicketId, retire, confirm }) => {
       const path = `/service/templates/${id}`;
       const template = await client.get<CwRecord>(path);
       const lean = toLeanTemplate(template);
       const usage = await readTemplateUsage(client, id, new Date());
 
-      if (usage.recentTicketCount > 0) {
+      const forward = { openTickets: usage.openTickets, pendingBookings: usage.pendingBookings };
+      const active = usage.recentTicketCount > 0 || usage.pendingBookings.length > 0;
+      if (active && retire !== true) {
+        const why =
+          usage.recentTicketCount > 0
+            ? `generated ${usage.recentTicketCount} ticket(s) in the last ${TEMPLATE_DELETE_GUARD_DAYS} days`
+            : `has ${usage.pendingBookings.length} booking(s) that are not done yet`;
         return refuse(
-          `Template ${id} generated ${usage.recentTicketCount} ticket(s) in the last ${TEMPLATE_DELETE_GUARD_DAYS} days, so it is not deleted. Nothing was changed.`,
-          { deleted: false, reason: "recent-tickets", template: lean, recentTickets: usage.recentTickets },
-        );
-      }
-      if (usage.pendingBookings.length > 0) {
-        return refuse(
-          `Template ${id} has ${usage.pendingBookings.length} booking(s) that are not done yet, so it is not deleted. Nothing was changed.`,
-          { deleted: false, reason: "pending-bookings", template: lean, pendingBookings: usage.pendingBookings },
+          `Template ${id} ${why}, so it is not deleted. Nothing was changed. To stop an active template, pass retire: true.`,
+          {
+            deleted: false,
+            reason: usage.recentTicketCount > 0 ? "recent-tickets" : "pending-bookings",
+            template: lean,
+            recentTickets: usage.recentTickets,
+            forward,
+          },
         );
       }
 
@@ -389,13 +416,19 @@ export function registerTemplateTools(server: McpServer, client: CwManageClient)
       const noteText =
         `Service template ${id} was deleted. Name: ${String(template.name ?? "")}. ` +
         `Company: ${company?.name ?? "none"}. Board: ${board?.name ?? "none"}. ` +
+        (active
+          ? `Retired while active: ${usage.recentTicketCount} ticket(s) generated in the last ${TEMPLATE_DELETE_GUARD_DAYS} days, ` +
+            `${usage.openTickets.length} ticket(s) still open, ${usage.pendingBookings.length} booking(s) not done. `
+          : "") +
         `Reason: ${reason}`;
       const note = { ticketId: noteTicketId, ticketSummary: noteTicket.summary ?? null, text: noteText };
 
       if (confirm !== true) {
         return refuse("No write was made. Pass confirm: true to delete this template.", {
           deleted: false,
+          retire: active,
           template: lean,
+          forward,
           note,
         });
       }
@@ -434,9 +467,18 @@ export function registerTemplateTools(server: McpServer, client: CwManageClient)
         content: [
           jsonText({
             deleted: true,
+            retired: active,
             verified,
             templateGone,
             template: lean,
+            followUp: {
+              message:
+                usage.openTickets.length + usage.pendingBookings.length === 0
+                  ? "The template left no open ticket and no booking that is not done."
+                  : "This tool closed no ticket and removed no booking. Show each one below to the user before any write.",
+              ticketsToClose: usage.openTickets,
+              bookingsToRemove: usage.pendingBookings,
+            },
             note: {
               ...note,
               added: noteId !== null,

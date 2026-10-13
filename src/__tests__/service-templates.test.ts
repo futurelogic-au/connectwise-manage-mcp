@@ -67,8 +67,10 @@ interface Call {
 
 interface FakeState {
   templates: Record<number, Record<string, unknown>>;
-  /** Tickets a ticket search returns, whatever the conditions. */
+  /** Tickets the search for recently generated tickets returns. */
   recentTickets?: Record<string, unknown>[];
+  /** Tickets the search for open generated tickets (closedFlag=false) returns. */
+  openTickets?: Record<string, unknown>[];
   /** Schedule entries a schedule search returns, whatever the conditions. */
   pendingBookings?: Record<string, unknown>[];
   tickets?: Record<number, Record<string, unknown>>;
@@ -138,7 +140,8 @@ function fakeConnectWise(state: FakeState) {
       }
     }
     if (path === "/service/tickets" && method === "GET") {
-      return jsonResponse(firstPage ? (state.recentTickets ?? []) : []);
+      const wanted = (query.conditions ?? "").includes("closedFlag=false") ? state.openTickets : state.recentTickets;
+      return jsonResponse(firstPage ? (wanted ?? []) : []);
     }
     if (path === "/schedule/entries" && method === "GET") {
       return jsonResponse(firstPage ? (state.pendingBookings ?? []) : []);
@@ -252,6 +255,7 @@ describe("cw_list_service_templates and cw_get_service_template", () => {
     expect(out.usage).toEqual({
       recentTicketCount: 1,
       recentTickets: [{ id: 903832, summary: "Visit", closedFlag: false, dateEntered: "2026-10-01T17:00:05Z" }],
+      openTickets: [],
       pendingBookings: [{ id: 1, name: "Visit", member: "cappleton", dateStart: "2026-12-09T00:30:00Z", dateEnd: "2026-12-09T01:00:00Z" }],
     });
     const tickets = cw.calls.find((entry) => entry.path === "/service/tickets")!;
@@ -430,8 +434,107 @@ describe("cw_delete_service_template", () => {
     });
     const result = await call("cw_delete_service_template", { ...args, confirm: true });
     expect(result.isError).toBe(true);
-    expect(json(result)).toMatchObject({ deleted: false, reason: "pending-bookings", pendingBookings: [{ id: 1078158 }] });
+    expect(json(result)).toMatchObject({
+      deleted: false,
+      reason: "pending-bookings",
+      forward: { pendingBookings: [{ id: 1078158 }] },
+    });
     expect(writes(cw.calls)).toEqual([]);
+  });
+
+  describe("retire", () => {
+    const active = (): FakeState => ({
+      templates: { 600: template(600) },
+      tickets: noteTicket,
+      recentTickets: [{ id: 903832, summary: "Visit", closedFlag: false, _info: { dateEntered: "2026-10-01T17:00:05Z" } }],
+      openTickets: [
+        { id: 903832, summary: "Visit", status: { name: "Scheduled" }, owner: { identifier: "cappleton" }, _info: { dateEntered: "2026-10-01T17:00:05Z" } },
+        { id: 880001, summary: "Old visit", status: { name: "Waiting" }, owner: null, _info: { dateEntered: "2026-05-01T17:00:05Z" } },
+      ],
+      pendingBookings: [{ id: 1078158, name: "Visit", member: { identifier: "cappleton" }, dateStart: "2026-12-09T00:30:00Z", dateEnd: "2026-12-09T01:00:00Z" }],
+    });
+    const forward = {
+      openTickets: [
+        { id: 903832, summary: "Visit", status: "Scheduled", owner: "cappleton", dateEntered: "2026-10-01T17:00:05Z" },
+        { id: 880001, summary: "Old visit", status: "Waiting", owner: null, dateEntered: "2026-05-01T17:00:05Z" },
+      ],
+      pendingBookings: [{ id: 1078158, name: "Visit", member: "cappleton", dateStart: "2026-12-09T00:30:00Z", dateEnd: "2026-12-09T01:00:00Z" }],
+    };
+
+    it("is a schema option on the delete tool, not a required one", async () => {
+      const tools = (await mcp<{ tools: ListedTool[] }>("tools/list", {})).result.tools;
+      const tool = tools.find((entry) => entry.name === "cw_delete_service_template")!;
+      expect(tool.inputSchema.properties).toHaveProperty("retire");
+      expect(tool.inputSchema.required).not.toContain("retire");
+    });
+
+    it("still refuses an active template without the flag, and lists its forward work", async () => {
+      const cw = fakeConnectWise(active());
+      const result = await call("cw_delete_service_template", { ...args, confirm: true });
+      expect(result.isError).toBe(true);
+      const out = json(result);
+      expect(out).toMatchObject({ deleted: false, reason: "recent-tickets", forward });
+      expect(String(out.message)).toMatch(/pass retire: true/);
+      expect(writes(cw.calls)).toEqual([]);
+    });
+
+    it("treats retire: false the same as no flag", async () => {
+      const cw = fakeConnectWise(active());
+      const result = await call("cw_delete_service_template", { ...args, retire: false, confirm: true });
+      expect(json(result)).toMatchObject({ deleted: false, reason: "recent-tickets" });
+      expect(writes(cw.calls)).toEqual([]);
+    });
+
+    it("writes nothing with the flag but no confirm, and the plan lists the forward tickets and bookings", async () => {
+      const cw = fakeConnectWise(active());
+      const result = await call("cw_delete_service_template", { ...args, retire: true });
+      expect(result.isError).toBe(true);
+      const out = json(result) as { note: { text: string } };
+      expect(out).toMatchObject({ saved: false, deleted: false, retire: true, forward });
+      expect(out.note.text).toBe(
+        "Service template 600 was deleted. Name: ZZ MCP Test. Company: Future Logic. Board: Board. " +
+          "Retired while active: 1 ticket(s) generated in the last 90 days, 2 ticket(s) still open, 1 booking(s) not done. " +
+          "Reason: WS4 test template, no longer needed",
+      );
+      expect(writes(cw.calls)).toEqual([]);
+      expect(cw.state.templates[600]).toBeDefined();
+    });
+
+    it("deletes an active template with the flag, confirm and a reason, and hands back the follow-up", async () => {
+      const cw = fakeConnectWise(active());
+      const result = await call("cw_delete_service_template", { ...args, retire: true, confirm: true });
+      expect(result.isError).not.toBe(true);
+      const out = json(result) as { followUp: { message: string } };
+      expect(out).toMatchObject({
+        deleted: true,
+        retired: true,
+        verified: true,
+        templateGone: true,
+        followUp: { ticketsToClose: forward.openTickets, bookingsToRemove: forward.pendingBookings },
+      });
+      expect(out.followUp.message).toMatch(/closed no ticket and removed no booking/);
+      // The template and the note are the only writes: no ticket is closed and no booking removed.
+      expect(writes(cw.calls).map((entry) => `${entry.method} ${entry.path}`)).toEqual([
+        "DELETE /service/templates/600",
+        "POST /service/tickets/904995/notes",
+      ]);
+      expect(cw.state.templates[600]).toBeUndefined();
+    });
+
+    it("lists an old open ticket in the plan of a template that is not active, without needing the flag", async () => {
+      const state = active();
+      state.recentTickets = [];
+      state.pendingBookings = [];
+      const cw = fakeConnectWise(state);
+      const result = await call("cw_delete_service_template", { ...args, confirm: true });
+      expect(result.isError).not.toBe(true);
+      expect(json(result)).toMatchObject({
+        deleted: true,
+        retired: false,
+        followUp: { ticketsToClose: forward.openTickets, bookingsToRemove: [] },
+      });
+      expect(writes(cw.calls)).toHaveLength(2);
+    });
   });
 
   it("deletes nothing when the note ticket cannot be read", async () => {
