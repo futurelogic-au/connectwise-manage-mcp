@@ -152,6 +152,28 @@ async function readTemplateUsage(client: CwManageClient, id: number, now: Date):
   };
 }
 
+/**
+ * Check the reference values of a patch against a fresh read. A patch may set
+ * a reference as an object, for example company to { id: 250 }, and ConnectWise
+ * can answer 200 and still not keep it. Returns the paths whose id the fresh
+ * read does not hold, and the paths this check settled either way.
+ */
+export function checkReferencePatches(
+  record: CwRecord,
+  operations: Array<{ op: string; path: string; value?: unknown }>,
+): { mismatches: string[]; checked: string[] } {
+  const mismatches: string[] = [];
+  const checked: string[] = [];
+  for (const operation of operations) {
+    const wanted = asRecord(operation.value)?.id;
+    const segments = operation.path.split("/").filter(Boolean);
+    if (operation.op === "remove" || typeof wanted !== "number" || segments.length !== 1) continue;
+    checked.push(operation.path);
+    if (asRecord(record[segments[0]])?.id !== wanted) mismatches.push(operation.path);
+  }
+  return { mismatches, checked };
+}
+
 function refuse(message: string, extra: CwRecord = {}) {
   return { content: [jsonText({ saved: false, message, ...extra })], isError: true };
 }
@@ -344,14 +366,24 @@ export function registerTemplateTools(server: McpServer, client: CwManageClient)
         };
       }
       const check = checkPatchAgainstRecord(fresh, operations);
-      const verified = check.mismatches.length === 0;
+      // The shared check leaves a reference set as an object unchecked. Settle those here,
+      // because ConnectWise can accept such a patch and not keep the value.
+      const references = checkReferencePatches(fresh, operations);
+      const mismatches = [...new Set([...check.mismatches, ...references.mismatches])];
+      const unchecked = check.unchecked.filter((path) => !references.checked.includes(path));
+      const verified = mismatches.length === 0;
       return {
         content: [
           jsonText({
             saved: true,
             verified,
-            ...(check.mismatches.length > 0 ? { mismatches: check.mismatches } : {}),
-            ...(check.unchecked.length > 0 ? { unchecked: check.unchecked } : {}),
+            ...(mismatches.length > 0
+              ? {
+                  mismatches,
+                  message: "ConnectWise accepted the patch, but the fresh read does not hold every value that was sent.",
+                }
+              : {}),
+            ...(unchecked.length > 0 ? { unchecked } : {}),
             template: toLeanTemplate(fresh),
           }),
         ],
@@ -362,7 +394,7 @@ export function registerTemplateTools(server: McpServer, client: CwManageClient)
 
   server.tool(
     "cw_delete_service_template",
-    `Delete one service ticket template (DELETE /service/templates/{id}). Requires confirm: true, a reason, and noteTicketId: the service ticket where the delete is recorded as an internal note. A template that generated a ticket in the last ${TEMPLATE_DELETE_GUARD_DAYS} days is refused, and so is a template with a booking that is not done yet, unless retire: true is passed. Retire is the way to stop an active template recurring, because the API holds no recurrence to end: with retire: true, confirm: true and a reason, an active template is deleted. The plan always lists the template's forward work: the tickets it made that are still open and its bookings that are not done. Without confirm: true nothing is written and the plan is returned. After the delete the tool adds the internal note naming the template and the reason, then reads the template back (expecting it gone) and the note back. The tool never closes a ticket or removes a booking: after a retire it returns them in followUp, and each one is shown to the user before any write.`,
+    `Delete one service ticket template (DELETE /service/templates/{id}). Requires confirm: true, a reason, and noteTicketId: the service ticket where the delete is recorded as an internal note. A template that generated a ticket in the last ${TEMPLATE_DELETE_GUARD_DAYS} days is refused, and so is a template with a booking that is not done yet, unless retire: true is passed. Retire is the way to stop an active template recurring, because the API holds no recurrence to end: with retire: true, confirm: true and a reason, an active template is deleted. The plan always lists the template's forward work: the tickets it made that are still open and its bookings that are not done. Without confirm: true nothing is written and the plan is returned. After the delete the tool adds the internal note naming the template and the reason, then reads the template back (expecting it gone) and the note back. The tool never closes a ticket or removes a booking: after a retire it returns them in followUp, and each one is shown to the user before any write. A booking is then removed with cw_delete_schedule_entry and noteTicketId, and a ticket is closed with cw_update_ticket.`,
     {
       id: z.number().int().positive().describe("Service template ID"),
       reason: z.string().trim().min(3).describe("Why the template is being deleted. Written into the ticket note"),
@@ -475,7 +507,7 @@ export function registerTemplateTools(server: McpServer, client: CwManageClient)
               message:
                 usage.openTickets.length + usage.pendingBookings.length === 0
                   ? "The template left no open ticket and no booking that is not done."
-                  : "This tool closed no ticket and removed no booking. Show each one below to the user before any write.",
+                  : "This tool closed no ticket and removed no booking. Show each one below to the user before any write. Remove a booking with cw_delete_schedule_entry, passing noteTicketId. Close a ticket with cw_update_ticket.",
               ticketsToClose: usage.openTickets,
               bookingsToRemove: usage.pendingBookings,
             },

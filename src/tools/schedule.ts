@@ -89,6 +89,17 @@ export function linkedTicketPath(entry: { objectId?: unknown; type?: NamedRef | 
 }
 
 /**
+ * True for a booking a service template made ahead of its ticket: schedule
+ * type 12, "SR Template", identifier R. Its objectId is the template id, so it
+ * links to no ticket.
+ */
+export function isTemplateBooking(entry: { type?: NamedRef | null }): boolean {
+  const identifier = entry.type?.identifier?.toUpperCase();
+  const name = entry.type?.name?.toLowerCase();
+  return identifier === "R" || name === "sr template";
+}
+
+/**
  * Register the schedule entry tools (search, list types and statuses, create,
  * JSON Patch update, and a guarded delete) on the MCP server.
  *
@@ -312,7 +323,7 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
 
   server.tool(
     "cw_delete_schedule_entry",
-    "Delete a wrong booking (Manage DELETE /schedule/entries/{id}). Only a future schedule entry that is not done is deleted. A done entry, an entry that has started, or an entry with time logged against it is refused, and so is an entry that is not booked against a service ticket or a project ticket, because the delete is recorded as an internal note on that ticket. Requires confirm: true and a reason. Without confirm: true nothing is written and the plan is returned. After the delete the tool adds an internal note to the linked ticket naming the member, the original date and time in Perth time, and the reason, then reads the entry and the note back.",
+    "Delete a wrong booking (Manage DELETE /schedule/entries/{id}). Only a future schedule entry that is not done is deleted. A done entry, an entry that has started, or an entry with time logged against it is refused, and so is an entry that is not booked against a service ticket or a project ticket, because the delete is recorded as an internal note on that ticket. One other kind is accepted: a booking a service template made ahead of its ticket (schedule type SR Template), for example after the template is retired with cw_delete_service_template. That booking links to a template, not a ticket, so noteTicketId is required for it and names the service ticket that gets the note. Requires confirm: true and a reason. Without confirm: true nothing is written and the plan is returned. After the delete the tool adds an internal note to the ticket naming the member, the original date and time in Perth time, and the reason, then reads the entry and the note back.",
     {
       id: z.number().int().positive().describe("Schedule entry ID"),
       reason: z
@@ -320,13 +331,21 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
         .trim()
         .min(3)
         .describe("Why the booking is being deleted. Written into the ticket note"),
+      noteTicketId: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Only for a template booking (schedule type SR Template): the service ticket that gets the internal note. Not accepted for any other booking",
+        ),
       confirm: z
         .boolean()
         .optional()
         .describe("Must be true for the delete to happen. Omitted or false makes no write"),
     },
     SCHEDULE_WRITE,
-    async ({ id, reason, confirm }) => {
+    async ({ id, reason, noteTicketId, confirm }) => {
       const entryPath = `/schedule/entries/${id}`;
       const refuse = (why: string, extra: Record<string, unknown> = {}) => ({
         content: [
@@ -349,8 +368,15 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
       const member = entry.member as NamedRef | undefined;
       const dateStart = typeof entry.dateStart === "string" ? entry.dateStart : undefined;
       const dateEnd = typeof entry.dateEnd === "string" ? entry.dateEnd : undefined;
-      const linked = linkedTicketPath(entry as { objectId?: unknown; type?: NamedRef | null });
       const entryType = entry.type as NamedRef | null | undefined;
+      const templateBooking = isTemplateBooking({ type: entryType });
+      const ownTicket = linkedTicketPath(entry as { objectId?: unknown; type?: NamedRef | null });
+      // A template booking has no ticket of its own, so the caller names the one that takes the note.
+      const linked =
+        ownTicket ??
+        (templateBooking && noteTicketId !== undefined
+          ? { kind: "service" as const, id: noteTicketId, notesPath: `/service/tickets/${noteTicketId}/notes` }
+          : null);
       const summary = {
         id,
         member: member ? { id: member.id ?? null, name: member.name ?? null } : null,
@@ -359,7 +385,7 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
         objectId: typeof entry.objectId === "number" ? entry.objectId : null,
         // The type's name, else the ticket kind it resolves to, else its identifier. A type
         // that carries only an identifier used to show as null.
-        type: entryType?.name ?? linked?.kind ?? entryType?.identifier ?? null,
+        type: entryType?.name ?? (templateBooking ? "SR Template" : linked?.kind) ?? entryType?.identifier ?? null,
       };
 
       // D9: future, not-done entries only.
@@ -377,6 +403,19 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
         );
       }
 
+      if (noteTicketId !== undefined && !templateBooking) {
+        return refuse(
+          `noteTicketId is only for a template booking (schedule type SR Template). Schedule entry ${id} is not one, so its note goes on its own ticket. Nothing was changed.`,
+          { entry: summary },
+        );
+      }
+      if (templateBooking && !linked) {
+        return refuse(
+          `Schedule entry ${id} is a template booking and links to no ticket. Pass noteTicketId, the service ticket that gets the note. Nothing was changed.`,
+          { entry: summary },
+        );
+      }
+
       // The delete is recorded on the linked ticket, so there has to be one.
       if (!linked) {
         return refuse(
@@ -385,8 +424,12 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
         );
       }
 
+      // A template booking's note ticket must be readable before the delete, so the note has somewhere to go.
+      if (templateBooking) await client.get(`/service/tickets/${linked.id}`);
+
       // Time against it: a time entry for the same member on the same ticket inside the booking.
-      if (member?.id !== undefined && dateEnd) {
+      // A template booking has no ticket yet, so no time can sit against it.
+      if (!templateBooking && member?.id !== undefined && dateEnd) {
         const timeEntries = await client.get<Array<{ id?: number }>>("/time/entries", {
           conditions: `chargeToId = ${linked.id} and member/id = ${member.id} and timeStart >= [${dateStart}] and timeStart <= [${dateEnd}]`,
           pageSize: 5,
@@ -401,7 +444,9 @@ export function registerScheduleTools(server: McpServer, client: CwManageClient)
 
       const who = member?.name ? `${member.name}${member.identifier ? ` (${member.identifier})` : ""}` : `member ${member?.id ?? "unknown"}`;
       const noteText =
-        `Schedule entry ${id} was deleted. Member: ${who}. ` +
+        `Schedule entry ${id} was deleted. ` +
+        (templateBooking ? `It was a booking made ahead by service template ${summary.objectId ?? "unknown"}. ` : "") +
+        `Member: ${who}. ` +
         `Was booked: ${formatPerth(dateStart!)} to ${dateEnd ? formatPerth(dateEnd) : "unknown"} Perth time (AWST). ` +
         `Reason: ${reason}`;
 

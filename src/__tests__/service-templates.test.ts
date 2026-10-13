@@ -8,7 +8,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../worker.js";
-import { daysAgoIso, templateIdFromEnteredBy, toLeanTemplate } from "../tools/templates.js";
+import { checkReferencePatches, daysAgoIso, templateIdFromEnteredBy, toLeanTemplate } from "../tools/templates.js";
 
 const headers = {
   Accept: "application/json, text/event-stream",
@@ -358,6 +358,32 @@ describe("cw_update_service_template", () => {
     expect(json(result)).toMatchObject({ saved: true, verified: false, mismatches: ["summary"] });
   });
 
+  it("reports a reference ConnectWise accepted but did not keep, as seen live on company", async () => {
+    // The live server answered 200 to company { id: 250 } on a template and left company empty.
+    fakeConnectWise({ templates: { 600: template(600, { company: undefined }) }, ignorePatch: true });
+    const result = await call("cw_update_service_template", {
+      id: 600,
+      operations: [{ op: "replace", path: "company", value: { id: 250 } }],
+      confirm: true,
+    });
+    expect(result.isError).toBe(true);
+    const out = json(result);
+    expect(out).toMatchObject({ saved: true, verified: false, mismatches: ["company"] });
+    expect(out).not.toHaveProperty("unchecked");
+    expect(String(out.message)).toMatch(/does not hold every value/);
+  });
+
+  it("verifies a reference the fresh read does hold", async () => {
+    fakeConnectWise({ templates: { 600: template(600) } });
+    const result = await call("cw_update_service_template", {
+      id: 600,
+      operations: [{ op: "replace", path: "status", value: { id: 2186 } }],
+      confirm: true,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(json(result)).toMatchObject({ saved: true, verified: true });
+  });
+
   it("refuses a patch on the id, or with no value, before any request", async () => {
     const cw = fakeConnectWise({ templates: { 600: template(600) } });
     for (const operations of [[{ op: "replace", path: "id", value: 1 }], [{ op: "replace", path: "/id", value: 1 }], [{ op: "replace", path: "summary" }]]) {
@@ -513,6 +539,7 @@ describe("cw_delete_service_template", () => {
         followUp: { ticketsToClose: forward.openTickets, bookingsToRemove: forward.pendingBookings },
       });
       expect(out.followUp.message).toMatch(/closed no ticket and removed no booking/);
+      expect(out.followUp.message).toMatch(/cw_delete_schedule_entry, passing noteTicketId/);
       // The template and the note are the only writes: no ticket is closed and no booking removed.
       expect(writes(cw.calls).map((entry) => `${entry.method} ${entry.path}`)).toEqual([
         "DELETE /service/templates/600",
@@ -570,6 +597,31 @@ describe("cw_delete_service_template", () => {
     expect((await call("cw_delete_service_template", { id: 600, reason: "  ", noteTicketId: 904995, confirm: true })).isError).toBe(true);
     expect((await call("cw_delete_service_template", { id: 600, reason: "Test done", confirm: true })).isError).toBe(true);
     expect(cw.fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("checkReferencePatches", () => {
+  const record = { company: { id: 250 }, status: { id: 5 }, summary: "S" };
+
+  it("passes a reference the record holds and flags one it does not", () => {
+    expect(
+      checkReferencePatches(record, [
+        { op: "replace", path: "company", value: { id: 250 } },
+        { op: "replace", path: "/status", value: { id: 9 } },
+        { op: "add", path: "team", value: { id: 3 } },
+      ]),
+    ).toEqual({ mismatches: ["/status", "team"], checked: ["company", "/status", "team"] });
+  });
+
+  it("leaves alone what it cannot judge: plain values, nested paths, removes and objects with no id", () => {
+    expect(
+      checkReferencePatches(record, [
+        { op: "replace", path: "summary", value: "T" },
+        { op: "replace", path: "company/id", value: 250 },
+        { op: "remove", path: "status" },
+        { op: "replace", path: "status", value: { name: "New" } },
+      ]),
+    ).toEqual({ mismatches: [], checked: [] });
   });
 });
 
