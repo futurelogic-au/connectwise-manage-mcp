@@ -72,6 +72,8 @@ const BOARD_ASSIGN_FLAGS = [
   "autoAssignNewECTicketsFlag",
   "autoAssignNewPortalTicketsFlag",
   "autoAssignTicketOwnerFlag",
+  "autoAssignLimitFlag",
+  "autoAssignLimitAmount",
 ];
 const BOARD_ROLE_MEMBERS = [
   "dispatchMember",
@@ -239,7 +241,14 @@ function toTeam(team: CwRecord, members: Map<number, LeanMember>): CwRecord {
     members: memberIdsOf(team).map(
       (id) => members.get(id) ?? { id, identifier: null, name: null, inactiveFlag: null },
     ),
-    ...pick(team, ["boardId", "locationId", "businessUnitId", "notifyOnTicketDelete"]),
+    ...pick(team, [
+      "roundRobinFlag",
+      "defaultRoundRobinFlag",
+      "boardId",
+      "locationId",
+      "businessUnitId",
+      "notifyOnTicketDelete",
+    ]),
   };
 }
 
@@ -277,8 +286,327 @@ async function readParsingStyles(client: CwManageClient, connectorId: number): P
 }
 
 // ---------------------------------------------------------------------------
+// Workflow event conditions
+// ---------------------------------------------------------------------------
+
+/** True, false, or null where the trace cannot tell. */
+export type Tri = boolean | null;
+
+export interface ConditionTerm {
+  triggerId: number | null;
+  /** The term in words, as ConnectWise describes it. */
+  text: string;
+  result: "true" | "false" | "unknown";
+  /** Why a term is unknown. */
+  reason?: string;
+}
+
+export interface ConditionMatch {
+  result: "match" | "no-match" | "unknown";
+  /** False when the condition text could not be read, so nothing was evaluated. */
+  parsed: boolean;
+  terms: ConditionTerm[];
+}
+
+type ConditionNode =
+  | { kind: "term"; term: CwRecord }
+  | { kind: "and" | "or"; nodes: ConditionNode[] };
+
+type ConditionToken = "(" | ")" | "and" | "or" | CwRecord;
+
+/**
+ * Split an eventCondition into tokens. ConnectWise holds a condition as JSON
+ * objects, one per term, joined by "and" and "or" with brackets for grouping.
+ * Returns null for text that is not in that form.
+ */
+function tokeniseCondition(text: string): ConditionToken[] | null {
+  const tokens: ConditionToken[] = [];
+  let index = 0;
+  while (index < text.length) {
+    const char = text[index];
+    if (/\s/.test(char)) {
+      index++;
+    } else if (char === "(" || char === ")") {
+      tokens.push(char);
+      index++;
+    } else if (char === "{") {
+      // Find the closing brace of this object, skipping braces inside strings.
+      let depth = 0;
+      let inString = false;
+      let close = -1;
+      for (let cursor = index; cursor < text.length; cursor++) {
+        const current = text[cursor];
+        if (inString) {
+          if (current === "\\") cursor++;
+          else if (current === '"') inString = false;
+        } else if (current === '"') {
+          inString = true;
+        } else if (current === "{") {
+          depth++;
+        } else if (current === "}" && --depth === 0) {
+          close = cursor;
+          break;
+        }
+      }
+      if (close < 0) return null;
+      try {
+        const parsed = asRecord(JSON.parse(text.slice(index, close + 1)));
+        if (!parsed) return null;
+        tokens.push(parsed);
+      } catch {
+        return null;
+      }
+      index = close + 1;
+    } else {
+      const word = /^(and|or)\b/i.exec(text.slice(index));
+      if (!word) return null;
+      tokens.push(word[1].toLowerCase() as "and" | "or");
+      index += word[1].length;
+    }
+  }
+  return tokens;
+}
+
+/** Parse tokens into a tree. "and" binds tighter than "or". */
+function parseCondition(tokens: ConditionToken[]): ConditionNode | null {
+  let position = 0;
+  const primary = (): ConditionNode | null => {
+    const token = tokens[position];
+    if (token === "(") {
+      position++;
+      const inner = either();
+      if (!inner || tokens[position] !== ")") return null;
+      position++;
+      return inner;
+    }
+    if (token === undefined || typeof token === "string") return null;
+    position++;
+    return { kind: "term", term: token };
+  };
+  const chain = (kind: "and" | "or", next: () => ConditionNode | null) => (): ConditionNode | null => {
+    const first = next();
+    if (!first) return null;
+    const nodes = [first];
+    while (tokens[position] === kind) {
+      position++;
+      const more = next();
+      if (!more) return null;
+      nodes.push(more);
+    }
+    return nodes.length === 1 ? first : { kind, nodes };
+  };
+  const both = chain("and", primary);
+  const either: () => ConditionNode | null = chain("or", both);
+  const tree = either();
+  return tree && position === tokens.length ? tree : null;
+}
+
+/**
+ * The triggers the trace evaluates, by the id ConnectWise gives them in
+ * /system/workflows/{id}/triggers. Only triggers seen in a live condition are
+ * here (and SR-ActualAgeLessThan, the mirror of 239). Every other trigger is
+ * reported as unknown, never guessed.
+ */
+const TRIGGER_STATUS = 33;
+const TRIGGER_PRIORITY = 19;
+const TRIGGER_ACTUAL_AGE_LESS = 238;
+const TRIGGER_ACTUAL_AGE_MORE = 239;
+
+function evaluateTerm(term: CwRecord, ticket: CwRecord, now: Date): ConditionTerm {
+  const value = asRecord(term.value) ?? {};
+  const raw = typeof value.value === "string" || typeof value.value === "number" ? String(value.value) : "";
+  const shown = typeof value.description === "string" && value.description ? value.description : raw;
+  const template = typeof term.description === "string" ? term.description : "";
+  const triggerId = typeof term.triggerId === "number" ? term.triggerId : null;
+  const text = template ? template.replace("{value}", shown) : `trigger ${triggerId ?? "?"} ${shown}`.trim();
+  const done = (result: Tri, reason?: string): ConditionTerm => ({
+    triggerId,
+    text,
+    result: result === null ? "unknown" : result ? "true" : "false",
+    ...(result === null && reason ? { reason } : {}),
+  });
+
+  const wanted = Number(raw);
+  if (triggerId === TRIGGER_STATUS || triggerId === TRIGGER_PRIORITY) {
+    if (raw === "" || !Number.isInteger(wanted)) return done(null, "The term holds no id to compare.");
+    return done(idOf(triggerId === TRIGGER_STATUS ? ticket.status : ticket.priority) === wanted);
+  }
+  if (triggerId === TRIGGER_ACTUAL_AGE_MORE || triggerId === TRIGGER_ACTUAL_AGE_LESS) {
+    const entered = asRecord(ticket._info)?.dateEntered;
+    const enteredAt = typeof entered === "string" ? Date.parse(entered) : NaN;
+    if (raw === "" || Number.isNaN(wanted) || Number.isNaN(enteredAt)) {
+      return done(null, "The term or the ticket holds no value to compare.");
+    }
+    if (ticket.closedFlag === true) return done(null, "The ticket is closed, so its age now is not its age when the rule ran.");
+    const hours = (now.getTime() - enteredAt) / 3_600_000;
+    return done(triggerId === TRIGGER_ACTUAL_AGE_MORE ? hours > wanted : hours < wanted);
+  }
+  return done(null, "This trigger is not one the trace evaluates.");
+}
+
+function triAnd(values: Tri[]): Tri {
+  if (values.includes(false)) return false;
+  return values.includes(null) ? null : true;
+}
+
+function triOr(values: Tri[]): Tri {
+  if (values.includes(true)) return true;
+  return values.includes(null) ? null : false;
+}
+
+/**
+ * Evaluate one workflow event condition against a ticket as the ticket is now.
+ * A term the trace cannot evaluate is unknown, and an unknown term makes the
+ * whole condition unknown unless the other terms settle it.
+ */
+export function evaluateEventCondition(condition: unknown, ticket: CwRecord, now: Date = new Date()): ConditionMatch {
+  const tokens = typeof condition === "string" ? tokeniseCondition(condition) : null;
+  const tree = tokens && tokens.length > 0 ? parseCondition(tokens) : null;
+  if (!tree) return { result: "unknown", parsed: false, terms: [] };
+
+  const terms: ConditionTerm[] = [];
+  const walk = (node: ConditionNode): Tri => {
+    if (node.kind === "term") {
+      const term = evaluateTerm(node.term, ticket, now);
+      terms.push(term);
+      return term.result === "unknown" ? null : term.result === "true";
+    }
+    const values = node.nodes.map(walk);
+    return node.kind === "and" ? triAnd(values) : triOr(values);
+  };
+  const result = walk(tree);
+  return { result: result === null ? "unknown" : result ? "match" : "no-match", parsed: true, terms };
+}
+
+// ---------------------------------------------------------------------------
 // Routing trace
 // ---------------------------------------------------------------------------
+
+/** A member as the trace knows them. A name read from the audit trail has no id. */
+export interface TraceMember {
+  id: number | null;
+  identifier?: string | null;
+  name: string | null;
+}
+
+export interface OwnerChange {
+  from: string;
+  to: string;
+  enteredDate: string | null;
+  enteredBy: string | null;
+}
+
+export interface AuditFacts {
+  /** Owner changes, oldest first. */
+  ownerChanges: OwnerChange[];
+  /** Members the board assigned by itself, in the order it assigned them. */
+  autoAssigned: string[];
+  /** Workflow events the audit trail says ran on the ticket. */
+  workflowRuns: Array<{ rule: string; eventId: number; count: number; first: string | null; last: string | null }>;
+}
+
+const OWNER_CHANGE = /^Owner has been updated from "(.*)" to "(.*)"\.?\s*$/;
+const AUTO_ASSIGNED = /automatic assignment\.[\s\S]*Member:\s*(.+?)\s*$/;
+const WORKFLOW_RAN = /^Workflow "(.+)" ran on this ticket\. EventID: "(\d+)"/;
+
+/**
+ * Read the facts the trace needs from a ticket's audit trail. ConnectWise
+ * returns the trail newest first, so it is reversed here: lines written in the
+ * same second then stay in the order they were written.
+ */
+export function readAuditFacts(audit: CwRecord[]): AuditFacts {
+  const facts: AuditFacts = { ownerChanges: [], autoAssigned: [], workflowRuns: [] };
+  const oldestFirst = [...audit]
+    .reverse()
+    .map((entry, index) => ({ entry, index }))
+    .sort((a, b) => {
+      const left = typeof a.entry.enteredDate === "string" ? Date.parse(a.entry.enteredDate) : 0;
+      const right = typeof b.entry.enteredDate === "string" ? Date.parse(b.entry.enteredDate) : 0;
+      return left - right || a.index - b.index;
+    })
+    .map((item) => item.entry);
+
+  for (const entry of oldestFirst) {
+    const text = typeof entry.text === "string" ? entry.text.replace(/\\n/g, "\n") : "";
+    const enteredDate = typeof entry.enteredDate === "string" ? entry.enteredDate : null;
+    const enteredBy = typeof entry.enteredBy === "string" ? entry.enteredBy : null;
+
+    const owner = OWNER_CHANGE.exec(text);
+    if (owner) {
+      facts.ownerChanges.push({ from: owner[1], to: owner[2], enteredDate, enteredBy });
+      continue;
+    }
+    const assigned = AUTO_ASSIGNED.exec(text);
+    if (assigned) {
+      facts.autoAssigned.push(assigned[1]);
+      continue;
+    }
+    const ran = WORKFLOW_RAN.exec(text);
+    if (ran) {
+      const eventId = Number(ran[2]);
+      const known = facts.workflowRuns.find((run) => run.rule === ran[1] && run.eventId === eventId);
+      if (known) {
+        known.count++;
+        known.last = enteredDate;
+      } else {
+        facts.workflowRuns.push({ rule: ran[1], eventId, count: 1, first: enteredDate, last: enteredDate });
+      }
+    }
+  }
+  return facts;
+}
+
+function sameName(left: unknown, right: unknown): boolean {
+  return (
+    typeof left === "string" &&
+    typeof right === "string" &&
+    left.trim() !== "" &&
+    left.trim().toLowerCase() === right.trim().toLowerCase()
+  );
+}
+
+/** True when a ConnectWise reference is this member: by id where both have one, else by name. */
+function isMember(reference: unknown, member: TraceMember): boolean {
+  const record = asRecord(reference);
+  if (!record) return false;
+  if (typeof record.id === "number" && member.id !== null) return record.id === member.id;
+  return sameName(record.name, member.name);
+}
+
+/**
+ * The owner the ticket arrived with. The first owner change in the audit trail
+ * names it. With no owner change, the current owner is the owner it arrived
+ * with. The audit trail gives a name only, so the id is looked up in the teams.
+ */
+export function findArrivedOwner(
+  ticket: CwRecord,
+  facts: AuditFacts,
+  teams: CwRecord[],
+): (TraceMember & { basis: string }) | null {
+  const current = toRef(ticket.owner);
+  const first = facts.ownerChanges[0];
+  if (!first) {
+    return current
+      ? { ...current, basis: "The audit trail holds no owner change, so the current owner is the first owner." }
+      : null;
+  }
+  const basis = "The first owner change in the audit trail was from this member.";
+  if (first.from.trim() === "") return null;
+  if (current && sameName(current.name, first.from)) return { ...current, basis };
+  for (const team of teams) {
+    const candidates = [team.teamLeader, ...((team.members as unknown[] | undefined) ?? [])];
+    const found = candidates.map(asRecord).find((member) => member && sameName(member.name, first.from));
+    if (found && typeof found.id === "number") {
+      return {
+        id: found.id,
+        identifier: typeof found.identifier === "string" ? found.identifier : null,
+        name: first.from,
+        basis,
+      };
+    }
+  }
+  return { id: null, name: first.from, basis };
+}
 
 /** What the trace read for one ticket, before any conclusion is drawn. */
 export interface RoutingEvidence {
@@ -288,47 +616,71 @@ export interface RoutingEvidence {
   teams: CwRecord[];
   connectors: CwRecord[];
   workflowRules: CwRecord[];
-  audit: CwRecord[];
+  facts: AuditFacts;
 }
 
 export interface OwnerCandidate {
   source:
+    | "board-auto-assign"
     | "workflow-action"
     | "email-connector-default-member"
     | "board-auto-assign-resource"
     | "team-leader"
     | "board-role-member"
     | "entered-by-owner";
+  /** "audit" when the audit trail shows it happened, "setup" when the setup only allows it. */
+  evidence: "audit" | "setup";
   detail: string;
   [key: string]: unknown;
 }
 
-/** Audit trail lines that speak about the owner. */
-export function ownerAuditEntries(audit: CwRecord[]): CwRecord[] {
-  return audit.filter((entry) => typeof entry.text === "string" && /\bowner\b/i.test(entry.text));
-}
-
 /**
- * List every piece of setup that names the ticket's owner. A candidate is
- * setup that could have set the owner, not proof that it did: the audit trail
- * says what happened, and the candidates say which setup agrees with it.
+ * List every piece of setup that explains why this member owned the ticket.
+ * A candidate with evidence "audit" is backed by a line in the audit trail. A
+ * candidate with evidence "setup" is setup that names the member and could
+ * have set the owner, not proof that it did.
  */
-export function findOwnerCandidates(evidence: RoutingEvidence): OwnerCandidate[] {
-  const owner = asRecord(evidence.ticket.owner);
-  const ownerId = idOf(owner);
-  if (ownerId === null) return [];
+export function findOwnerCandidates(evidence: RoutingEvidence, owner: TraceMember | null): OwnerCandidate[] {
+  if (!owner) return [];
   const boardId = idOf(evidence.ticket.board);
+  const teamId = idOf(evidence.ticket.team);
   const candidates: OwnerCandidate[] = [];
+  const boardFlags = evidence.board ? pick(evidence.board, BOARD_ASSIGN_FLAGS) : {};
+
+  const position = evidence.facts.autoAssigned.findIndex((name) => sameName(name, owner.name));
+  if (position >= 0) {
+    const ownerFlag = evidence.board?.autoAssignTicketOwnerFlag === true;
+    candidates.push({
+      source: "board-auto-assign",
+      evidence: "audit",
+      detail:
+        `The audit trail shows the board assigned ${evidence.facts.autoAssigned.length} member(s) by itself when the ticket was created, and this member was number ${position + 1}. ` +
+        (ownerFlag
+          ? "The board's autoAssignTicketOwnerFlag is on, so the board also sets the owner from that assignment."
+          : "The board's autoAssignTicketOwnerFlag is not on, so this assignment made the member a resource, not the owner."),
+      position: position + 1,
+      autoAssigned: evidence.facts.autoAssigned,
+      boardFlags,
+      resources: evidence.autoAssignResources.map((resource) => ({
+        member: toRef(resource.member),
+        notifyWho: toRef(resource.notifyWho),
+      })),
+    });
+  }
 
   for (const rule of evidence.workflowRules) {
     for (const event of (rule.events as CwRecord[] | undefined) ?? []) {
       for (const action of (event.actions as CwRecord[] | undefined) ?? []) {
-        if (idOf(action.specificMemberTo) !== ownerId) continue;
+        if (!isMember(action.specificMemberTo, owner)) continue;
+        const ran = evidence.facts.workflowRuns.some((run) => run.eventId === event.id);
         candidates.push({
           source: "workflow-action",
-          detail: `Workflow rule "${String(rule.name)}", event "${String(event.name)}" has an action that names this member.`,
-          rule: { id: rule.id ?? null, name: rule.name ?? null, activateFlag: rule.activateFlag === true },
-          event: { id: event.id ?? null, name: event.name ?? null, eventCondition: event.eventCondition ?? null },
+          evidence: ran ? "audit" : "setup",
+          detail:
+            `Workflow rule "${String(rule.name)}", event "${String(event.name)}" has an action that names this member. ` +
+            (ran ? "The audit trail shows this event ran on the ticket." : "The audit trail does not show this event ran on the ticket."),
+          rule: { id: rule.id ?? null, name: rule.name ?? null },
+          event: { id: event.id ?? null, name: event.name ?? null },
           action: {
             id: action.id ?? null,
             notifyType: toRef(action.notifyType),
@@ -340,43 +692,50 @@ export function findOwnerCandidates(evidence: RoutingEvidence): OwnerCandidate[]
   }
 
   for (const connector of evidence.connectors) {
-    if (idOf(connector.defaultMember) !== ownerId) continue;
+    if (!isMember(connector.defaultMember, owner)) continue;
     if (boardId !== null && idOf(connector.serviceBoard) !== boardId) continue;
     candidates.push({
       source: "email-connector-default-member",
+      evidence: "setup",
       detail: "An email connector that files to this board has this member as its default member.",
-      connector: toLeanEmailConnector(connector),
+      connector: { id: connector.id ?? null, mailbox: connectorMailbox(connector) },
     });
   }
 
-  if (evidence.autoAssignResources.some((resource) => idOf(resource.member) === ownerId)) {
+  if (position < 0 && evidence.autoAssignResources.some((resource) => isMember(resource.member, owner))) {
     candidates.push({
       source: "board-auto-assign-resource",
+      evidence: "setup",
       detail: "This member is an auto-assign resource on the board.",
-      boardFlags: evidence.board ? pick(evidence.board, BOARD_ASSIGN_FLAGS) : {},
+      boardFlags,
     });
   }
 
-  const teamId = idOf(evidence.ticket.team);
   for (const team of evidence.teams) {
-    if (idOf(team.teamLeader) !== ownerId) continue;
+    if (!isMember(team.teamLeader, owner)) continue;
     if (team.id !== teamId && team.defaultFlag !== true) continue;
     candidates.push({
       source: "team-leader",
+      evidence: "setup",
       detail:
         team.id === teamId
           ? "This member leads the ticket's team."
           : "This member leads the board's default team.",
-      team: { id: team.id ?? null, name: team.name ?? null, defaultFlag: team.defaultFlag === true },
-      autoAssignTicketOwnerFlag: evidence.board?.autoAssignTicketOwnerFlag ?? null,
+      team: {
+        id: team.id ?? null,
+        name: team.name ?? null,
+        defaultFlag: team.defaultFlag === true,
+        ...pick(team, ["roundRobinFlag", "defaultRoundRobinFlag"]),
+      },
     });
   }
 
   if (evidence.board) {
-    const roles = BOARD_ROLE_MEMBERS.filter((role) => idOf(evidence.board?.[role]) === ownerId);
+    const roles = BOARD_ROLE_MEMBERS.filter((role) => isMember(evidence.board?.[role], owner));
     if (roles.length > 0) {
       candidates.push({
         source: "board-role-member",
+        evidence: "setup",
         detail: `This member holds a board role: ${roles.join(", ")}.`,
         roles,
       });
@@ -384,18 +743,24 @@ export function findOwnerCandidates(evidence: RoutingEvidence): OwnerCandidate[]
   }
 
   const enteredBy = asRecord(evidence.ticket._info)?.enteredBy;
-  if (typeof enteredBy === "string" && typeof owner?.identifier === "string") {
-    if (enteredBy.toLowerCase() === owner.identifier.toLowerCase()) {
-      candidates.push({
-        source: "entered-by-owner",
-        detail: "The owner is the member who entered the ticket.",
-        enteredBy,
-        autoAssignTicketOwnerFlag: evidence.board?.autoAssignTicketOwnerFlag ?? null,
-      });
-    }
+  if (sameName(enteredBy, owner.identifier)) {
+    candidates.push({
+      source: "entered-by-owner",
+      evidence: "setup",
+      detail: "This member is the member the ticket was entered by.",
+      enteredBy,
+    });
   }
 
   return candidates;
+}
+
+function connectorMailbox(connector: CwRecord): string | null {
+  for (const key of ["office365EmailSetup", "imapSetup", "googleEmailSetup"]) {
+    const name = asRecord(connector[key])?.name;
+    if (typeof name === "string") return name;
+  }
+  return null;
 }
 
 const TRACE_TICKET_REFS = [
@@ -418,8 +783,40 @@ function toTraceTicket(ticket: CwRecord): CwRecord {
     id: ticket.id ?? null,
     summary: ticket.summary ?? null,
     ...Object.fromEntries(TRACE_TICKET_REFS.map((key) => [key, toRef(ticket[key])])),
-    ...pick(ticket, ["recordType", "resources", "parentTicketId"]),
+    ...pick(ticket, ["recordType", "closedFlag", "resources", "parentTicketId"]),
     _info: pick(info, ["dateEntered", "enteredBy", "lastUpdated", "updatedBy"]),
+  };
+}
+
+const TRACE_ACTION_REFS = [
+  "notifyType",
+  "notifyWho",
+  "notifyFrom",
+  "specificMemberTo",
+  "specificTeamTo",
+  "board",
+  "boardStatus",
+  "serviceType",
+  "serviceSubType",
+  "serviceItem",
+  "servicePriority",
+  "serviceTemplate",
+];
+
+/** A workflow event as the trace returns it: what it does and whether it matches. */
+function toTraceEvent(event: CwRecord, ticket: CwRecord, facts: AuditFacts, now: Date): CwRecord {
+  const ran = facts.workflowRuns.find((run) => run.eventId === event.id);
+  return {
+    id: event.id ?? null,
+    name: event.name ?? null,
+    ...pick(event, ["frequencyOfExecution", "frequencyUnit", "executionTime", "maxNumberOfExecution"]),
+    conditionMatch: evaluateEventCondition(event.eventCondition, ticket, now),
+    ranOnTicket: ran ? { count: ran.count, first: ran.first, last: ran.last } : { count: 0 },
+    actions: ((event.actions as CwRecord[] | undefined) ?? []).map((action) => ({
+      id: action.id ?? null,
+      ...pickRefs(action, TRACE_ACTION_REFS),
+      ...pick(action, ["emailRecipient", "subject", "updateOwnerFlag", "daysToExecute"]),
+    })),
   };
 }
 
@@ -635,7 +1032,7 @@ export function registerSetupTools(server: McpServer, client: CwManageClient) {
 
   server.tool(
     "cw_trace_ticket_routing",
-    "Trace why a service ticket sits on its board and team with its owner. Returns the ticket's board, team and owner; the ticket's audit trail lines about the owner; the board's auto-assign flags, auto-assign resources and role members; the ticket's team and the board's default team with their leaders; the email connectors that file to the board with their default members; and the board's active workflow rules with their events and actions. candidates lists every piece of setup that names the ticket's owner. A candidate is setup that could have set the owner, not proof: the audit trail says what happened. Event conditions are returned as ConnectWise holds them and are not evaluated against the ticket. A section that could not be read is named in unread with its error, and nothing is guessed for it. Read-only.",
+    "Trace why a service ticket sits on its board and team, and why it had the owner it arrived with. Returns the ticket's board, team and current owner; arrivedOwner, the owner before the first owner change in the audit trail; ownerChanges, every owner change since; autoAssigned, the members the board assigned by itself at creation; candidates, every piece of setup that explains the arrived owner (evidence 'audit' when the audit trail shows it happened, 'setup' when the setup only allows it); the board's auto-assign flags, auto-assign resources and role members; the ticket's team and the board's default team with leaders, members and round robin flags; the email connectors that file to the board; and the board's active workflow rules. Each workflow event carries conditionMatch, its condition evaluated against the ticket as it is now (status, priority and actual age terms are evaluated, any other trigger is 'unknown'), and ranOnTicket, how often the audit trail says the event ran on this ticket. A section that could not be read is named in unread with its error, and nothing is guessed for it. Read-only.",
     { ticketId: z.number().int().positive().describe("Service ticket ID") },
     SETUP_READ_ONLY,
     async ({ ticketId }) => {
@@ -684,6 +1081,7 @@ export function registerSetupTools(server: McpServer, client: CwManageClient) {
         });
       }
 
+      const facts = readAuditFacts(audit);
       const evidence: RoutingEvidence = {
         ticket,
         board,
@@ -691,26 +1089,40 @@ export function registerSetupTools(server: McpServer, client: CwManageClient) {
         teams,
         connectors,
         workflowRules,
-        audit,
+        facts,
       };
+      const arrivedOwner = findArrivedOwner(ticket, facts, teams);
       const teamId = idOf(ticket.team);
+      const ticketTeam = teams.find((team) => team.id === teamId) ?? null;
+      const defaultTeam = teams.find((team) => team.defaultFlag === true) ?? null;
+      const now = new Date();
 
       return jsonContent({
         ticket: toTraceTicket(ticket),
-        ownerAudit: ownerAuditEntries(audit),
+        arrivedOwner,
+        ownerChanges: facts.ownerChanges,
+        autoAssigned: facts.autoAssigned,
+        candidates: findOwnerCandidates(evidence, arrivedOwner),
         auditEntryCount: audit.length,
-        candidates: findOwnerCandidates(evidence),
         board: board ? toBoardAssignment(board) : null,
         autoAssignResources: autoAssignResources.map((resource) => ({
           id: resource.id ?? null,
           member: toRef(resource.member),
           notifyWho: toRef(resource.notifyWho),
         })),
-        ticketTeam: teams.find((team) => team.id === teamId) ?? null,
-        defaultTeam: teams.find((team) => team.defaultFlag === true) ?? null,
+        ticketTeam,
+        defaultTeam:
+          defaultTeam && ticketTeam && defaultTeam.id === ticketTeam.id
+            ? { id: defaultTeam.id, name: defaultTeam.name, sameAsTicketTeam: true }
+            : defaultTeam,
         emailConnectors: connectors.map(toLeanEmailConnector),
-        workflowRules,
-        conditionsEvaluated: false,
+        workflowRules: workflowRules.map((rule) => ({
+          ...rule,
+          events: ((rule.events as CwRecord[] | undefined) ?? []).map((event) =>
+            toTraceEvent(event, ticket, facts, now),
+          ),
+        })),
+        conditionsEvaluatedAt: now.toISOString(),
         unread,
       });
     },
