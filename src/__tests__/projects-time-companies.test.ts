@@ -82,7 +82,11 @@ interface World {
   dropPhase: boolean;
   /** Make the time entry accept the create but drop billableOption. */
   dropBillable: boolean;
-  /** Refuse a time entry with no timeSheet as "time period not open". */
+  /**
+   * The member's time sheet for the period is submitted or approved. As seen live on
+   * 13/10/2026: an entry with no timeSheet is refused as "time period not open", and an
+   * entry with a timeSheet is answered with a bare 500.
+   */
   periodClosed: boolean;
   /** The 400 body for that refusal. Default: ConnectWise's own wording, as seen live. */
   refusalBody: Rec | null;
@@ -148,7 +152,10 @@ function fakeConnectWise(initial: Partial<World> = {}) {
     }
 
     if (path === "/time/entries" && method === "POST") {
-      if (world.periodClosed && !payload?.timeSheet) {
+      if (world.periodClosed && payload?.timeSheet) {
+        return jsonResponse({ code: "ServerError", message: "An unexpected error occurred" }, 500);
+      }
+      if (world.periodClosed) {
         return jsonResponse(world.refusalBody ?? { code: "InvalidObject", message: LIVE_PERIOD_REFUSAL }, 400);
       }
       const record: Rec = { id: 800, ...payload };
@@ -481,6 +488,26 @@ describe("cw_create_time_entry", () => {
     expect(cw.calls.some((c) => c.method === "PATCH")).toBe(false);
   });
 
+  it("sends emailContactFlag false unless it is passed as true, so no contact is emailed by accident", async () => {
+    const cw = fakeConnectWise({ serviceTickets: openTicket });
+
+    await call("cw_create_time_entry", entry);
+    await call("cw_create_time_entry", { ...entry, emailContactFlag: false });
+    await call("cw_create_time_entry", { ...entry, emailContactFlag: true });
+
+    const posts = cw.calls.filter((c) => c.method === "POST").map((c) => (c.body as Rec).emailContactFlag);
+    expect(posts).toEqual([false, false, true]);
+  });
+
+  it("shows emailContactFlag false in the plan when it is not passed", async () => {
+    fakeConnectWise({ serviceTickets: openTicket });
+    const { confirm: _confirm, ...noConfirm } = entry as Rec;
+
+    const result = await call("cw_create_time_entry", noConfirm);
+
+    expect(body(result)).toMatchObject({ saved: false, planned: { emailContactFlag: false } });
+  });
+
   it("passes the time sheet as timeSheet.id", async () => {
     const cw = fakeConnectWise({ serviceTickets: openTicket });
 
@@ -507,14 +534,17 @@ describe("cw_create_time_entry", () => {
     expect(body(result)).toMatchObject({ verified: { billableOption: false } });
   });
 
-  it("explains a time period that is not open and says what to pass", async () => {
+  it("explains a time period that is not open and gives the supported way to add the time", async () => {
     fakeConnectWise({ serviceTickets: openTicket, periodClosed: true });
 
     const result = await call("cw_create_time_entry", entry);
 
     expect(result.isError).toBe(true);
     expect(body(result)).toMatchObject({ saved: false, reason: "time-period-not-open" });
-    expect(String(body(result).message)).toMatch(/Pass timeSheetId/);
+    const message = String(body(result).message);
+    // It no longer tells the caller to pass timeSheetId: the live server refuses that too.
+    expect(message).toMatch(/Passing timeSheetId does not get around that/);
+    expect(message).toMatch(/reverse it with cw_reverse_time_sheet.*create the entry.*cw_submit_time_sheet.*cw_approve_time_sheet/);
   });
 
   it("matches ConnectWise's exact wording, which has 25 characters between 'time period' and 'not open'", async () => {
@@ -562,11 +592,38 @@ describe("cw_create_time_entry", () => {
     expect(result.content[0].text).not.toMatch(/time-period-not-open/);
   });
 
-  it("accepts the same entry once the sheet id is passed", async () => {
-    fakeConnectWise({ serviceTickets: openTicket, periodClosed: true });
+  it("names the 500 ConnectWise gives when timeSheetId points at a sheet that is not Open", async () => {
+    const cw = fakeConnectWise({ serviceTickets: openTicket, periodClosed: true });
+
     const result = await call("cw_create_time_entry", { ...entry, timeSheetId: 4321 });
-    expect(result.isError).not.toBe(true);
-    expect(body(result)).toMatchObject({ id: 800 });
+
+    expect(result.isError).toBe(true);
+    const out = body(result);
+    expect(out).toMatchObject({ saved: false, reason: "time-sheet-not-open", timeSheetId: 4321 });
+    const message = String(out.message);
+    expect(message).toMatch(/answered 500 to an entry with timeSheetId 4321/);
+    expect(message).toMatch(/reverse it with cw_reverse_time_sheet/);
+    // The reference stays, so the call can be found in the log. The upstream body does not.
+    expect(message).toMatch(/returned 500 \(reference /);
+    expect(message).not.toContain("An unexpected error occurred");
+    expect(cw.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  });
+
+  it("does not rename a 500 on an entry that passed no timeSheetId", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init: RequestInit = {}) =>
+        init.method === "POST"
+          ? jsonResponse({ code: "ServerError", message: "boom" }, 500)
+          : jsonResponse({ id: 77, closedFlag: false }),
+      ),
+    );
+
+    const result = await call("cw_create_time_entry", entry);
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/returned 500/);
+    expect(result.content[0].text).not.toMatch(/time-sheet-not-open/);
   });
 
   it.each([

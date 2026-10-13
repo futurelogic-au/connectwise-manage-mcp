@@ -59,7 +59,7 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
 
   server.tool(
     "cw_create_time_entry",
-    "Create a new time entry. Requires confirm: true. Without it nothing is written and the planned body is returned. billableOption sets how the time bills (Billable, DoNotBill, NoCharge or NoDefault) at creation, so no patch is needed afterwards. A ticket that is closed refuses new time: the tool reports that and does not reopen the ticket. An entry on a time period that is submitted or past is refused with \"time period not open\" unless the member's time sheet is passed as timeSheetId (the sheet's ID for that period). When billableOption or timeSheetId is set, the entry is read back and the response carries a verified block.",
+    "Create a new time entry. Requires confirm: true. Without it nothing is written and the planned body is returned. billableOption sets how the time bills (Billable, DoNotBill, NoCharge or NoDefault) at creation, so no patch is needed afterwards. A ticket that is closed refuses new time: the tool reports that and does not reopen the ticket. ConnectWise takes new time only on a time sheet that is Open. An entry on a period whose sheet is submitted or approved is refused: with \"time period not open\", or with a 500 when timeSheetId is passed. timeSheetId does not get around that. To add time to an approved sheet: reverse it with cw_reverse_time_sheet (it then reads Open), create the entry, submit the sheet with cw_submit_time_sheet and approve it with cw_approve_time_sheet. A sheet that is submitted and not yet approved cannot be opened again through the API. emailContactFlag is sent as false unless it is passed as true, because ConnectWise otherwise takes the ticket's default and can email the ticket contact. When billableOption or timeSheetId is set, the entry is read back and the response carries a verified block.",
     {
       chargeToType: z.enum(["ServiceTicket", "ProjectTicket", "ChargeCode", "Activity"]).describe("What to charge the time to"),
       chargeToId: z.number().describe("ID of the ticket, charge code, or activity"),
@@ -80,7 +80,13 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
         .int()
         .positive()
         .optional()
-        .describe("Time sheet ID for the period the entry falls in. Needed to add time to a submitted or past period"),
+        .describe(
+          "Time sheet ID for the period the entry falls in. Optional: it only works while that sheet is Open. On a submitted or approved sheet ConnectWise answers 500",
+        ),
+      emailContactFlag: z
+        .boolean()
+        .optional()
+        .describe("Email the ticket contact about this time entry. Default: false. Never true unless passed"),
       confirm: z
         .boolean()
         .optional()
@@ -99,6 +105,7 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
       workRoleId,
       billableOption,
       timeSheetId,
+      emailContactFlag,
       confirm,
     }) => {
       const body: Record<string, unknown> = {
@@ -115,6 +122,8 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
       if (workRoleId) body.workRole = { id: workRoleId };
       if (billableOption) body.billableOption = billableOption;
       if (timeSheetId !== undefined) body.timeSheet = { id: timeSheetId };
+      // Always sent. Left out, ConnectWise takes the ticket's default, which can email the contact.
+      body.emailContactFlag = emailContactFlag === true;
 
       const fail = (reason: string, message: string, extra: Record<string, unknown> = {}) => ({
         content: [
@@ -179,9 +188,7 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
           if (TIME_PERIOD_NOT_OPEN.test(refusal)) {
             return fail(
               "time-period-not-open",
-              timeSheetId === undefined
-                ? "ConnectWise refused the entry because its time period is not open (the period is submitted or past). Pass timeSheetId, the member's time sheet for that period, and try again. Nothing was added."
-                : "ConnectWise refused the entry because its time period is not open, even with the time sheet passed. Check that timeSheetId is the member's sheet for the period of timeStart. Nothing was added.",
+              `ConnectWise refused the entry because its time period is not open: the member's time sheet for that period is submitted or approved. Passing timeSheetId does not get around that. To add time to an approved sheet: reverse it with cw_reverse_time_sheet (it then reads Open), create the entry, submit the sheet with cw_submit_time_sheet and approve it with cw_approve_time_sheet. A sheet that is submitted and not yet approved cannot be opened again through the API. Nothing was added.`,
             );
           }
           if (TICKET_CLOSED.test(refusal)) {
@@ -190,6 +197,15 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
               `ConnectWise refused the entry because the ticket is closed. No time was added and the ticket was not reopened.`,
             );
           }
+        }
+        // Seen live on 13/10/2026: with timeSheetId set, ConnectWise answers a time sheet that
+        // is not Open with a bare 500. The same call worked once the sheet was Open.
+        if (err instanceof CwApiError && err.status === 500 && timeSheetId !== undefined) {
+          return fail(
+            "time-sheet-not-open",
+            `ConnectWise answered 500 to an entry with timeSheetId ${timeSheetId}. It does that when the time sheet is not Open (submitted or approved). To add time to an approved sheet: reverse it with cw_reverse_time_sheet (it then reads Open), create the entry, submit the sheet with cw_submit_time_sheet and approve it with cw_approve_time_sheet. A sheet that is submitted and not yet approved cannot be opened again through the API. Nothing was added. ${err.message}`,
+            { timeSheetId },
+          );
         }
         throw err;
       }
