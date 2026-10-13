@@ -175,6 +175,16 @@ These tools read the setup that decides where a service ticket lands and who own
 - `cw_list_slas` / `cw_get_sla`: SLAs. The get returns the per-priority targets
 - `cw_trace_ticket_routing`: Given a ticket id, shows why the ticket sits on its board and team and why it had the owner it arrived with. `arrivedOwner` is the owner before the first owner change in the audit trail, `ownerChanges` lists every change since, and `autoAssigned` lists the members the board assigned by itself at creation. `candidates` lists every piece of setup that explains the arrived owner: evidence `audit` means the audit trail shows it happened, evidence `setup` means the setup only allows it. It also returns the board's auto-assign setup, the ticket's team and the default team, the email connectors that file to the board, and the board's active workflow rules. Each workflow event carries `conditionMatch`, its condition evaluated against the ticket as it is now, and `ranOnTicket`, how often the audit trail says it ran on this ticket. Status, priority and actual age terms are evaluated; any other trigger is reported as `unknown`, never guessed. A section that cannot be read is named in `unread`
 
+### Service Ticket Templates
+A service template is the record behind a recurring ticket (`/service/templates`). ConnectWise stamps what a template makes with `enteredBy` set to `template` plus the template id. The API does not return a template's recurrence, so no tool can end a recurrence and keep the template: to stop a template, retire it. No tool calls `generate`.
+- `cw_list_service_templates`: List templates, lean. Filter by company, board or part of the name
+- `cw_get_service_template`: One template as the full record, with the tickets it generated in the last 90 days, the tickets it made that are still open, and its bookings that are not done
+- `cw_trace_template_source`: Given a ticket id or a schedule entry id, return the template that generated it, or say plainly that a member entered it
+- `cw_update_service_template`: JSON Patch a template. Needs `confirm: true`; without it nothing is written and the plan is returned. Reads the template back and reports any value ConnectWise accepted but did not keep
+- `cw_delete_service_template`: Delete a template. Needs `confirm: true`, a `reason`, and `noteTicketId`, the service ticket that gets an internal note recording the delete. A template that generated a ticket in the last 90 days, or has a booking that is not done, is refused unless `retire: true` is passed. The plan lists the template's open tickets and its bookings that are not done. The tool closes no ticket and removes no booking: after a retire it returns them in `followUp`
+
+A booking a template made ahead of its ticket (schedule type SR Template) is removed with `cw_delete_schedule_entry` and `noteTicketId`.
+
 ### Activities
 - `cw_search_activities` — Search activities
 - `cw_get_activity` — Get an activity by ID

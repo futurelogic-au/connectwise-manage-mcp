@@ -256,7 +256,7 @@ describe("cw_delete_schedule_entry", () => {
     ).result.tools;
     const tool = tools.find((t) => t.name === "cw_delete_schedule_entry")!;
     expect(tool.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
-    expect(Object.keys(tool.inputSchema.properties).sort()).toEqual(["confirm", "id", "reason"]);
+    expect(Object.keys(tool.inputSchema.properties).sort()).toEqual(["confirm", "id", "noteTicketId", "reason"]);
     expect(tool.inputSchema.required?.sort()).toEqual(["id", "reason"]);
   });
 
@@ -403,6 +403,110 @@ describe("cw_delete_schedule_entry", () => {
     expect(out.note.added).toBe(false);
     expect(out.warning).toMatch(/Add the note text above to the ticket by hand/);
     expect(cw.state.entries[501]).toBeUndefined();
+  });
+});
+
+describe("cw_delete_schedule_entry, template bookings", () => {
+  // A booking a service template made ahead of its ticket: type 12, objectId is the template id.
+  const templateEntry = (over: Rec = {}) =>
+    entry({ id: 601, objectId: 565, name: "Gambara/PDSV - Cam - Gambara", type: { id: 12, identifier: "R" }, ...over });
+  const reason = "Template 565 was retired";
+
+  it("refuses a template booking with no noteTicketId and says what to pass", async () => {
+    const cw = fakeConnectWise({ entries: { 601: templateEntry() } });
+
+    const result = await call("cw_delete_schedule_entry", { id: 601, reason, confirm: true });
+
+    expect(result.isError).toBe(true);
+    const out = body(result);
+    expect(out).toMatchObject({ refused: true, deleted: false });
+    expect(String(out.message)).toMatch(/template booking and links to no ticket\. Pass noteTicketId/);
+    expect(cw.calls.some((c) => c.method !== "GET")).toBe(false);
+    expect(cw.state.entries[601]).toBeDefined();
+  });
+
+  it("makes no write without confirm: true and plans the note on noteTicketId", async () => {
+    const cw = fakeConnectWise({ entries: { 601: templateEntry() }, tickets: { 904995: ticket(904995) } });
+
+    const result = await call("cw_delete_schedule_entry", { id: 601, reason, noteTicketId: 904995 });
+
+    expect(result.isError).toBe(true);
+    const plan = body(result) as { deleted: boolean; note: { text: string; ticketId: number; ticketKind: string } };
+    expect(plan.deleted).toBe(false);
+    expect(plan.note).toMatchObject({ ticketKind: "service", ticketId: 904995 });
+    // The plan names the booking for what it is, not for the ticket that takes the note.
+    expect((body(result) as { entry: { type: string } }).entry.type).toBe("SR Template");
+    expect(plan.note.text).toContain("It was a booking made ahead by service template 565.");
+    expect(plan.note.text).toContain("Reason: Template 565 was retired");
+    expect(cw.calls.some((c) => c.method !== "GET")).toBe(false);
+    expect(cw.state.entries[601]).toBeDefined();
+  });
+
+  it("deletes with confirm: true, writes the internal note on noteTicketId and reads both back", async () => {
+    const cw = fakeConnectWise({ entries: { 601: templateEntry() }, tickets: { 904995: ticket(904995) } });
+
+    const result = await call("cw_delete_schedule_entry", { id: 601, reason, noteTicketId: 904995, confirm: true });
+
+    expect(result.isError).not.toBe(true);
+    expect(body(result)).toMatchObject({
+      deleted: true,
+      verified: true,
+      entryGone: true,
+      note: { added: true, readBack: true, ticketKind: "service", ticketId: 904995 },
+    });
+    const writes = cw.calls.filter((c) => c.method !== "GET");
+    expect(writes.map((c) => `${c.method} ${c.path}`)).toEqual([
+      "DELETE /schedule/entries/601",
+      "POST /service/tickets/904995/notes",
+    ]);
+    expect(writes[1].body).toMatchObject({ internalAnalysisFlag: true });
+    // No time entry is looked up: a template booking has no ticket for time to sit against.
+    expect(cw.calls.some((c) => c.path === "/time/entries")).toBe(false);
+    expect(cw.state.entries[601]).toBeUndefined();
+  });
+
+  it("still refuses a template booking that is done or has started", async () => {
+    const cw = fakeConnectWise({
+      entries: { 601: templateEntry({ doneFlag: true }), 602: templateEntry({ id: 602, dateStart: iso(-HOUR), dateEnd: iso(HOUR) }) },
+      tickets: { 904995: ticket(904995) },
+    });
+
+    for (const id of [601, 602]) {
+      const result = await call("cw_delete_schedule_entry", { id, reason, noteTicketId: 904995, confirm: true });
+      expect(body(result)).toMatchObject({ refused: true, deleted: false });
+    }
+    expect(cw.calls.some((c) => c.method !== "GET")).toBe(false);
+  });
+
+  it("deletes nothing when the note ticket cannot be read", async () => {
+    const cw = fakeConnectWise({ entries: { 601: templateEntry() } });
+
+    const result = await call("cw_delete_schedule_entry", { id: 601, reason, noteTicketId: 904995, confirm: true });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/\/service\/tickets\/904995 returned 404/);
+    expect(cw.calls.some((c) => c.method !== "GET")).toBe(false);
+    expect(cw.state.entries[601]).toBeDefined();
+  });
+
+  it("refuses noteTicketId on an ordinary booking, so its note cannot be sent elsewhere", async () => {
+    const cw = fakeConnectWise({ entries: { 501: entry() }, tickets: { 77: ticket(77), 904995: ticket(904995) } });
+
+    const result = await call("cw_delete_schedule_entry", { id: 501, reason, noteTicketId: 904995, confirm: true });
+
+    expect(result.isError).toBe(true);
+    expect(String(body(result).message)).toMatch(/noteTicketId is only for a template booking/);
+    expect(cw.calls.some((c) => c.method !== "GET")).toBe(false);
+    expect(cw.state.entries[501]).toBeDefined();
+  });
+
+  it("still refuses another unlinked booking type even with noteTicketId", async () => {
+    const cw = fakeConnectWise({ entries: { 501: entry({ type: { id: 9, identifier: "N" } }) }, tickets: { 904995: ticket(904995) } });
+
+    const result = await call("cw_delete_schedule_entry", { id: 501, reason, noteTicketId: 904995, confirm: true });
+
+    expect(body(result)).toMatchObject({ refused: true, deleted: false });
+    expect(cw.calls.some((c) => c.method !== "GET")).toBe(false);
   });
 });
 
