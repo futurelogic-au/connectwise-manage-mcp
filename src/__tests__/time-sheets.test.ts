@@ -412,6 +412,38 @@ describe("cw_submit_time_sheet", () => {
     expect(writes(cw.calls)).toEqual([]);
   });
 
+  it("carries the reject warning in the tool description, word for word", async () => {
+    const tools = (await mcp<{ tools: Array<ListedTool & { description: string }> }>("tools/list", {})).result.tools;
+    expect(tools.find((tool) => tool.name === "cw_reject_time_sheet")!.description).toContain(
+      "WARNING: Rejecting a sheet moves every entry not rejected to ReadyToBill (or PendingProjectApproval for project time), so reject every entry that needs fixing before the sheet.",
+    );
+  });
+
+  it("takes ErrorsCorrected as a good submit, which is what a Rejected sheet reads on the live server", async () => {
+    // Live on 14/10/2026: submitting Rejected sheet 13818 left it ErrorsCorrected, and the approve took it.
+    const state = sheet(900, { status: "Rejected" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init: RequestInit = {}) => {
+        if (init.method === "POST") {
+          state.status = state.status === "Rejected" ? "ErrorsCorrected" : "ApprovedByTierOne";
+          return jsonResponse({ success: true });
+        }
+        return jsonResponse(state);
+      }),
+    );
+    expect(json(await call("cw_submit_time_sheet", { id: 900, confirm: true }))).toMatchObject({
+      verified: true,
+      statusBefore: "Rejected",
+      statusAfter: "ErrorsCorrected",
+    });
+    expect(json(await call("cw_approve_time_sheet", { id: 900, confirm: true }))).toMatchObject({
+      verified: true,
+      statusBefore: "ErrorsCorrected",
+      statusAfter: "ApprovedByTierOne",
+    });
+  });
+
   it.each(["Open", "Rejected"])("submits a sheet that is %s with an empty body and reads PendingApproval back", async (status) => {
     const cw = fakeConnectWise({ sheets: { 900: sheet(900, { status }) } });
     const result = await call("cw_submit_time_sheet", { id: 900, confirm: true });
@@ -527,7 +559,9 @@ describe("cw_reject_time_sheet and cw_reverse_time_sheet (D20)", () => {
   it("warns in the reject plan that the other entries will be passed, and lists the entry rejects", async () => {
     const cw = fakeConnectWise({ sheets: { 900: sheet(900) }, entries: { 1: entry(1, { status: "PendingApproval" }) } });
     const out = json(await call("cw_reject_time_sheet", { id: 900, reason: "Wrong ticket", rejectEntryIds: [1] })) as { planned: Rec };
-    expect(String((out as Rec).message)).toMatch(/Every time entry on it that is not rejected will be passed/);
+    expect(String((out as Rec).message)).toContain(
+      "Rejecting a sheet moves every entry not rejected to ReadyToBill (or PendingProjectApproval for project time), so reject every entry that needs fixing before the sheet.",
+    );
     expect(out.planned).toEqual({
       first: ["POST /time/entries/1/reject"],
       call: "POST /time/sheets/900/reject",

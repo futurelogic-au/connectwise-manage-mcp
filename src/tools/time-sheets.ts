@@ -514,7 +514,7 @@ async function runSheetAction(
           saved: false,
           message:
             action === "reject"
-              ? "No write was made. Pass confirm: true to reject this time sheet. Every time entry on it that is not rejected will be passed, as if approved."
+              ? "No write was made. Pass confirm: true to reject this time sheet. Rejecting a sheet moves every entry not rejected to ReadyToBill (or PendingProjectApproval for project time), so reject every entry that needs fixing before the sheet."
               : `No write was made. Pass confirm: true to ${action} this time sheet.`,
           planned: {
             ...(entryCalls.length > 0 ? { first: entryCalls } : {}),
@@ -715,7 +715,7 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
 
   server.tool(
     "cw_submit_time_sheet",
-    "Submit one time sheet for approval (POST /time/sheets/{id}/submit). Only a sheet that is Open or Rejected is submitted. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good submit reads PendingApproval. The submit is recorded against the member whose keys make the call, which may not be the member whose sheet it is. A reverse leaves a sheet Open, so a reversed sheet is submitted again with this tool before it can be approved.",
+    "Submit one time sheet for approval (POST /time/sheets/{id}/submit). Only a sheet that is Open or Rejected is submitted. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good submit reads PendingApproval, or ErrorsCorrected for a sheet that was Rejected. The submit is recorded against the member whose keys make the call, which may not be the member whose sheet it is. A reverse leaves a sheet Open, so a reversed sheet is submitted again with this tool before it can be approved.",
     {
       id: z.number().int().positive().describe("Time sheet ID"),
       confirm: z.boolean().optional().describe("Must be true for the submit to happen. Omitted or false makes no write"),
@@ -737,7 +737,7 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
 
   server.tool(
     "cw_reject_time_sheet",
-    `Reject one submitted time sheet at tier one (POST /time/sheets/{id}/reject with approvalType ${TIER_ONE_APPROVAL_TYPE}). Only a submitted sheet (PendingApproval or ErrorsCorrected) is rejected. ConnectWise rejects a sheet only after at least one of its time entries is rejected. Pass the incorrect entries in rejectEntryIds, with a reason, and this tool rejects each one first (POST /time/entries/{id}/reject, with the reason as its comment), reads it back, then rejects the sheet. Every entry must be on this sheet, and the sheet is not rejected unless every entry rejected. A sheet with no rejected entry is refused by ConnectWise, named here as entries-not-rejected, and nothing is changed. Rejecting a sheet passes every time entry on it that is not rejected: seen live, those entries moved to ReadyToBill (PendingProjectApproval for project time). So reject a sheet only when its other entries are right, and read entryStatuses in the result. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good reject reads Rejected. ConnectWise's sheet reject takes no reason, so on the sheet the reason is only returned in the result. On a time entry it is stored as the reject comment.`,
+    `Reject one submitted time sheet at tier one (POST /time/sheets/{id}/reject with approvalType ${TIER_ONE_APPROVAL_TYPE}). Only a submitted sheet (PendingApproval or ErrorsCorrected) is rejected. ConnectWise rejects a sheet only after at least one of its time entries is rejected. Pass the incorrect entries in rejectEntryIds, with a reason, and this tool rejects each one first (POST /time/entries/{id}/reject, with the reason as its comment), reads it back, then rejects the sheet. Every entry must be on this sheet, and the sheet is not rejected unless every entry rejected. A sheet with no rejected entry is refused by ConnectWise, named here as entries-not-rejected, and nothing is changed. WARNING: Rejecting a sheet moves every entry not rejected to ReadyToBill (or PendingProjectApproval for project time), so reject every entry that needs fixing before the sheet. The result counts the sheet's entries by status in entryStatuses. To undo a reject: submit the sheet, approve it, then reverse it, which returns the sheet and every entry to Open. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good reject reads Rejected. ConnectWise's sheet reject takes no reason, so on the sheet the reason is only returned in the result. On a time entry it is stored as the reject comment.`,
     {
       id: z.number().int().positive().describe("Time sheet ID"),
       reason: z
