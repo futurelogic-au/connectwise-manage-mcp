@@ -391,6 +391,51 @@ async function changeSheetStatus(
   }
 }
 
+interface EntryReject {
+  timeEntryId: number;
+  ok: boolean;
+  statusBefore: string | null;
+  statusAfter: string | null;
+  error?: string;
+}
+
+/**
+ * Reject one time entry at tier one (POST /time/entries/{id}/reject) and read
+ * it back. Never throws: a failure is returned. The route is not in the
+ * published 2025.1 contract, but the live server has it, and it refuses a body
+ * with no comment ("The comment field is required").
+ */
+async function rejectTimeEntry(client: CwManageClient, timeEntryId: number, comment: string): Promise<EntryReject> {
+  const path = `/time/entries/${timeEntryId}`;
+  let statusBefore: string | null = null;
+  try {
+    statusBefore = statusOf(await client.get<CwRecord>(path));
+    await client.post(`${path}/reject`, { approvalType: TIER_ONE_APPROVAL_TYPE, comment });
+  } catch (err: unknown) {
+    return { timeEntryId, ok: false, statusBefore, statusAfter: statusBefore, error: errorMessage(err) };
+  }
+  try {
+    const statusAfter = statusOf(await client.get<CwRecord>(path));
+    return statusAfter === STATUS_REJECTED
+      ? { timeEntryId, ok: true, statusBefore, statusAfter }
+      : {
+          timeEntryId,
+          ok: false,
+          statusBefore,
+          statusAfter,
+          error: `ConnectWise accepted the reject, but the time entry reads ${statusAfter ?? "no status"}.`,
+        };
+  } catch (err: unknown) {
+    return {
+      timeEntryId,
+      ok: false,
+      statusBefore,
+      statusAfter: null,
+      error: `The reject was sent but the read back failed: ${errorMessage(err)}`,
+    };
+  }
+}
+
 const ALLOWED_FROM: Record<SheetAction, string[]> = {
   submit: NOT_SUBMITTED_STATUSES,
   approve: SUBMITTED_STATUSES,
@@ -412,7 +457,7 @@ const PAST_TENSE: Record<SheetAction, string> = {
 async function runSheetAction(
   client: CwManageClient,
   action: SheetAction,
-  args: { id: number; reason?: string; confirm?: boolean },
+  args: { id: number; reason?: string; confirm?: boolean; rejectEntryIds?: number[] },
 ) {
   const before = await client.get<CwRecord>(`/time/sheets/${args.id}`);
   const statusBefore = statusOf(before);
@@ -431,13 +476,51 @@ async function runSheetAction(
       isError: true,
     };
   }
+  // A sheet reject can reject time entries first. Each must be on this sheet.
+  const entryIds = [...new Set(args.rejectEntryIds ?? [])];
+  for (const entryId of entryIds) {
+    const entry = await client.get<CwRecord>(`/time/entries/${entryId}`);
+    if (idOf(entry.timeSheet) !== args.id) {
+      return {
+        content: [
+          jsonText({
+            saved: false,
+            message: `Time entry ${entryId} is not on time sheet ${args.id}, so nothing was rejected. Nothing was changed.`,
+            timeSheet: sheet,
+          }),
+        ],
+        isError: true,
+      };
+    }
+  }
+  const entryCalls = entryIds.map((entryId) => `POST /time/entries/${entryId}/reject`);
+  if (entryIds.length > 0 && !args.reason) {
+    return {
+      content: [
+        jsonText({
+          saved: false,
+          message: "No request to change anything was made. Rejecting a time entry needs a reason: ConnectWise takes it as the entry's reject comment.",
+          timeSheet: sheet,
+        }),
+      ],
+      isError: true,
+    };
+  }
+
   if (args.confirm !== true) {
     return {
       content: [
         jsonText({
           saved: false,
-          message: `No write was made. Pass confirm: true to ${action} this time sheet.`,
-          planned: { call: `POST /time/sheets/${args.id}/${action}`, ...bodyFor(action) },
+          message:
+            action === "reject"
+              ? "No write was made. Pass confirm: true to reject this time sheet. Every time entry on it that is not rejected will be passed, as if approved."
+              : `No write was made. Pass confirm: true to ${action} this time sheet.`,
+          planned: {
+            ...(entryCalls.length > 0 ? { first: entryCalls } : {}),
+            call: `POST /time/sheets/${args.id}/${action}`,
+            ...bodyFor(action),
+          },
           ...reason,
           timeSheet: sheet,
         }),
@@ -446,12 +529,52 @@ async function runSheetAction(
     };
   }
 
+  const entries: EntryReject[] = [];
+  for (const entryId of entryIds) {
+    const rejected = await rejectTimeEntry(client, entryId, args.reason ?? "");
+    entries.push(rejected);
+    if (!rejected.ok) {
+      // Stop at the first entry that did not reject: the sheet is not rejected on a part result.
+      return {
+        content: [
+          jsonText({
+            saved: entries.some((entry) => entry.ok),
+            verified: false,
+            action,
+            message: `Time entry ${entryId} was not rejected, so the time sheet was not rejected. Entries rejected before it stay rejected.`,
+            entries,
+            ...reason,
+            timeSheet: sheet,
+          }),
+        ],
+        isError: true,
+      };
+    }
+  }
+
   const change = await changeSheetStatus(client, args.id, action, statusBefore);
   let after: CwRecord | null = null;
   try {
     after = await client.get<CwRecord>(`/time/sheets/${args.id}`);
   } catch {
     /* reported through change.ok */
+  }
+  // A reject changes the sheet's other entries too, so count what each entry reads now.
+  let entryStatuses: Record<string, number> | undefined;
+  if (action === "reject") {
+    try {
+      const sheetEntries = await fetchAllPages<CwRecord>(client, "/time/entries", {
+        conditions: `timeSheet/id=${args.id}`,
+        fields: "id,status",
+      });
+      entryStatuses = {};
+      for (const entry of sheetEntries) {
+        const key = statusOf(entry) ?? "none";
+        entryStatuses[key] = (entryStatuses[key] ?? 0) + 1;
+      }
+    } catch {
+      /* left out: the sheet result still stands */
+    }
   }
   return {
     content: [
@@ -462,13 +585,15 @@ async function runSheetAction(
         ...bodyFor(action),
         statusBefore: change.statusBefore,
         statusAfter: change.statusAfter,
+        ...(entries.length > 0 ? { entries } : {}),
+        ...(entryStatuses ? { entryStatuses } : {}),
         ...reason,
         ...(change.error ? { error: change.error } : {}),
         ...(action === "reject" && change.error && ENTRIES_NOT_REJECTED.test(change.error)
           ? {
               refusal: "entries-not-rejected",
               message:
-                "ConnectWise rejects a time sheet only after at least one of its time entries is rejected. The API cannot reject a time entry, so reject the incorrect entries in Manage first, then run this again. Nothing was changed.",
+                "ConnectWise rejects a time sheet only after at least one of its time entries is rejected. Pass the incorrect entries in rejectEntryIds, or reject them first with cw_reject_time_entry, then run this again. Nothing was changed.",
             }
           : {}),
         timeSheet: after ? toLeanTimeSheet(after) : sheet,
@@ -612,7 +737,7 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
 
   server.tool(
     "cw_reject_time_sheet",
-    `Reject one submitted time sheet at tier one (POST /time/sheets/{id}/reject with approvalType ${TIER_ONE_APPROVAL_TYPE}). Only a submitted sheet (PendingApproval or ErrorsCorrected) is rejected. ConnectWise rejects a sheet only after at least one of its time entries is rejected, and the API has no way to reject a time entry (a patch of an entry's status is accepted and ignored). So reject the incorrect time entries in Manage first, then call this tool. A sheet with no rejected entry is refused with reason entries-not-rejected and nothing is changed. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good reject reads Rejected. ConnectWise's reject call takes no reason, so the reason is returned in the result for the caller's record and is not stored on the sheet.`,
+    `Reject one submitted time sheet at tier one (POST /time/sheets/{id}/reject with approvalType ${TIER_ONE_APPROVAL_TYPE}). Only a submitted sheet (PendingApproval or ErrorsCorrected) is rejected. ConnectWise rejects a sheet only after at least one of its time entries is rejected. Pass the incorrect entries in rejectEntryIds, with a reason, and this tool rejects each one first (POST /time/entries/{id}/reject, with the reason as its comment), reads it back, then rejects the sheet. Every entry must be on this sheet, and the sheet is not rejected unless every entry rejected. A sheet with no rejected entry is refused by ConnectWise, named here as entries-not-rejected, and nothing is changed. Rejecting a sheet passes every time entry on it that is not rejected: seen live, those entries moved to ReadyToBill (PendingProjectApproval for project time). So reject a sheet only when its other entries are right, and read entryStatuses in the result. Requires confirm: true. Without it nothing is written and the plan is returned. After the write the sheet is read back: a good reject reads Rejected. ConnectWise's sheet reject takes no reason, so on the sheet the reason is only returned in the result. On a time entry it is stored as the reject comment.`,
     {
       id: z.number().int().positive().describe("Time sheet ID"),
       reason: z
@@ -620,11 +745,82 @@ export function registerTimeSheetTools(server: McpServer, client: CwManageClient
         .trim()
         .min(3)
         .optional()
-        .describe("Why the sheet is rejected. Returned in the result. ConnectWise does not store it"),
+        .describe("Why the sheet is rejected. Returned in the result, and sent as the reject comment of each entry in rejectEntryIds. Needed when rejectEntryIds is passed"),
+      rejectEntryIds: z
+        .array(z.number().int().positive())
+        .max(50)
+        .optional()
+        .describe("Time entries on this sheet to reject first. ConnectWise needs at least one rejected entry before it rejects the sheet"),
       confirm: z.boolean().optional().describe("Must be true for the reject to happen. Omitted or false makes no write"),
     },
     TIME_SHEET_WRITE,
-    async ({ id, reason, confirm }) => runSheetAction(client, "reject", { id, reason, confirm }),
+    async ({ id, reason, rejectEntryIds, confirm }) =>
+      runSheetAction(client, "reject", { id, reason, rejectEntryIds, confirm }),
+  );
+
+  server.tool(
+    "cw_reject_time_entry",
+    `Reject one time entry at tier one (POST /time/entries/{id}/reject with approvalType ${TIER_ONE_APPROVAL_TYPE}). The entry's time sheet must be submitted (PendingApproval or ErrorsCorrected). Requires confirm: true. Without it nothing is written and the plan is returned. Requires a reason: ConnectWise refuses an entry reject with no comment, and the reason is sent as that comment. After the write the entry is read back: a good reject reads Rejected. ConnectWise rejects a time sheet only after one of its entries is rejected, so this comes before cw_reject_time_sheet, which can also do both in one call through rejectEntryIds.`,
+    {
+      id: z.number().int().positive().describe("Time entry ID"),
+      reason: z.string().trim().min(3).describe("Why the entry is rejected. Sent to ConnectWise as the reject comment"),
+      confirm: z.boolean().optional().describe("Must be true for the reject to happen. Omitted or false makes no write"),
+    },
+    TIME_SHEET_WRITE,
+    async ({ id, reason, confirm }) => {
+      const entry = await client.get<CwRecord>(`/time/entries/${id}`);
+      const sheetId = idOf(entry.timeSheet);
+      const sheet = sheetId === null ? null : await client.get<CwRecord>(`/time/sheets/${sheetId}`);
+      const sheetStatus = statusOf(sheet);
+      const summary = {
+        timeEntryId: id,
+        status: statusOf(entry),
+        timeStart: entry.timeStart ?? null,
+        actualHours: entry.actualHours ?? null,
+        timeSheet: sheet ? toLeanTimeSheet(sheet) : null,
+      };
+      const given = { reason };
+      if (!sheetStatus || !SUBMITTED_STATUSES.includes(sheetStatus)) {
+        return {
+          content: [
+            jsonText({
+              saved: false,
+              message: `Time entry ${id} is on a time sheet that is ${sheetStatus ?? "missing"}, so it is not rejected. This tool takes an entry whose sheet is ${SUBMITTED_STATUSES.join(" or ")}. Nothing was changed.`,
+              ...summary,
+            }),
+          ],
+          isError: true,
+        };
+      }
+      if (confirm !== true) {
+        return {
+          content: [
+            jsonText({
+              saved: false,
+              message: "No write was made. Pass confirm: true to reject this time entry.",
+              planned: { call: `POST /time/entries/${id}/reject`, approvalType: TIER_ONE_APPROVAL_TYPE, comment: reason },
+              ...given,
+              ...summary,
+            }),
+          ],
+          isError: true,
+        };
+      }
+      const rejected = await rejectTimeEntry(client, id, reason);
+      return {
+        content: [
+          jsonText({
+            saved: rejected.error === undefined || rejected.statusAfter !== rejected.statusBefore,
+            verified: rejected.ok,
+            action: "reject",
+            approvalType: TIER_ONE_APPROVAL_TYPE,
+            ...rejected,
+            ...given,
+          }),
+        ],
+        isError: !rejected.ok,
+      };
+    },
   );
 
   server.tool(

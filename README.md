@@ -141,7 +141,7 @@ needed.
 - `cw_get_time_entry` — Get a time entry by ID
 - `cw_create_time_entry`: Create a new time entry. `billableOption` (`Billable`, `DoNotBill`, `NoCharge` or `NoDefault`) is set at creation, so no patch is needed. `timeSheetId` adds time to a submitted or past period, which ConnectWise otherwise refuses with "time period not open"; that refusal comes back as `reason: "time-period-not-open"` with the fix named. A closed ticket refuses new time: the tool says so and never reopens the ticket. Needs `confirm: true`; without it nothing is written and the planned body is returned
 - `cw_update_time_entry` — Correct a time entry (JSON Patch on `PATCH /time/entries/{id}`). Use this to fix `actualHours` when a metered agreement rounds to 0.25.
-- `cw_delete_time_entry` — Delete a time entry (`DELETE /time/entries/{id}`). Manage rejects deletes of entries that are already billed.
+- `cw_delete_time_entry` — Delete a time entry (`DELETE /time/entries/{id}`). Needs `confirm: true`; without it nothing is written and the entry is returned. Reads back that the entry is gone. Manage rejects deletes of entries that are already billed.
 
 ### Time Sheets
 A time sheet is one member's time for one Saturday to Friday period (`/time/sheets`). Approval feeds billing, so every write needs `confirm: true` and is read back. Approvals are tier one only, recorded against the member whose keys make the call.
@@ -149,7 +149,8 @@ A time sheet is one member's time for one Saturday to Friday period (`/time/shee
 - `cw_get_time_sheet`: One time sheet with its audit trail and its time entries
 - `cw_submit_time_sheet`: Submit an Open or Rejected sheet. A good submit reads `PendingApproval`
 - `cw_approve_time_sheet`: Approve a submitted sheet at tier one. A good approval reads `ApprovedByTierOne`
-- `cw_reject_time_sheet`: Reject a submitted sheet. ConnectWise allows it only after at least one time entry on the sheet is rejected, and the API cannot reject a time entry, so reject the incorrect entries in Manage first
+- `cw_reject_time_entry`: Reject one time entry on a submitted sheet. Needs a `reason`, which ConnectWise takes as the reject comment. A good reject reads `Rejected`
+- `cw_reject_time_sheet`: Reject a submitted sheet. ConnectWise allows it only after at least one time entry on the sheet is rejected: pass those entries in `rejectEntryIds` with a `reason` and the tool rejects them first. **Rejecting a sheet passes every entry on it that is not rejected** (they move to `ReadyToBill`, or `PendingProjectApproval` for project time), so the result lists `entryStatuses`
 - `cw_reverse_time_sheet`: Reverse a tier one approval. Needs a `reason`. A reverse un-submits the sheet: it reads `Open`
 - `cw_edit_approved_time_entry`: Change one time entry on an approved sheet in four steps, each read back: reverse, patch the entry, submit, approve. Needs a `reason`. Returns every field of the time entry that changed, with `from` and `to` as a change log shows them and the raw `before` and `after` values. `unplannedChanges` names the fields ConnectWise changed by itself
 - `cw_list_missing_time_sheets`: The sheets that are Open or Rejected after 10am Perth time on the first business day after the period, on each member's own ConnectWise holiday list. Active members only. `excludeMembers` leaves members out; none is left out by default. `now` takes a Perth local time (`2026-10-13T11:00`) to judge another moment
