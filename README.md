@@ -141,7 +141,7 @@ needed.
 - `cw_get_time_entry` — Get a time entry by ID
 - `cw_create_time_entry`: Create a new time entry. `billableOption` (`Billable`, `DoNotBill`, `NoCharge` or `NoDefault`) is set at creation, so no patch is needed. `timeSheetId` adds time to a submitted or past period, which ConnectWise otherwise refuses with "time period not open"; that refusal comes back as `reason: "time-period-not-open"` with the fix named. A closed ticket refuses new time: the tool says so and never reopens the ticket. Needs `confirm: true`; without it nothing is written and the planned body is returned
 - `cw_update_time_entry` — Correct a time entry (JSON Patch on `PATCH /time/entries/{id}`). Use this to fix `actualHours` when a metered agreement rounds to 0.25.
-- `cw_delete_time_entry` — Delete a time entry (`DELETE /time/entries/{id}`). Needs `confirm: true`; without it nothing is written and the entry is returned. Reads back that the entry is gone. Manage rejects deletes of entries that are already billed.
+- `cw_delete_time_entry`: Delete a time entry (`DELETE /time/entries/{id}`). Needs `confirm: true`; without it nothing is written and the entry is returned. Reads back that the entry is gone. Manage rejects deletes of entries that are already billed.
 
 ### Time Sheets
 A time sheet is one member's time for one Saturday to Friday period (`/time/sheets`). Approval feeds billing, so every write needs `confirm: true` and is read back. Approvals are tier one only, recorded against the member whose keys make the call.
