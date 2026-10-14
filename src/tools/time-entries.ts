@@ -59,7 +59,7 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
 
   server.tool(
     "cw_create_time_entry",
-    "Create a new time entry. Requires confirm: true. Without it nothing is written and the planned body is returned. billableOption sets how the time bills (Billable, DoNotBill, NoCharge or NoDefault) at creation, so no patch is needed afterwards. A ticket that is closed refuses new time: the tool reports that and does not reopen the ticket. ConnectWise takes new time only on a time sheet that is Open. An entry on a period whose sheet is submitted or approved is refused: with \"time period not open\", or with a 500 when timeSheetId is passed. timeSheetId does not get around that. To add time to an approved sheet: reverse it with cw_reverse_time_sheet (it then reads Open), create the entry, submit the sheet with cw_submit_time_sheet and approve it with cw_approve_time_sheet. A sheet that is submitted and not yet approved cannot be opened again through the API. emailContactFlag is sent as false unless it is passed as true, because ConnectWise otherwise takes the ticket's default and can email the ticket contact. When billableOption or timeSheetId is set, the entry is read back and the response carries a verified block.",
+    "Create a new time entry. Requires confirm: true. Without it nothing is written and the planned body is returned. billableOption sets how the time bills (Billable, DoNotBill, NoCharge or NoDefault) at creation, so no patch is needed afterwards. A ticket that is closed refuses new time: the tool reports that and does not reopen the ticket. ConnectWise takes new time only on a time sheet that is Open. An entry on a period whose sheet is submitted or approved is refused: with \"time period not open\", or with a 500 when timeSheetId is passed. timeSheetId does not get around that. To add time to an approved sheet: reverse it with cw_reverse_time_sheet (it then reads Open), create the entry, submit the sheet with cw_submit_time_sheet and approve it with cw_approve_time_sheet. A sheet that is submitted and not yet approved cannot be opened again through the API. emailContactFlag is sent as false unless it is passed as true. ConnectWise does not always keep it: on a live ticket it returned true for an entry sent as false. So the flag is read back, and when the entry does not hold the value sent, the response carries emailContactFlag with sent and readBack, and a warning. When billableOption or timeSheetId is set, the entry is read back and the response carries a verified block.",
     {
       chargeToType: z.enum(["ServiceTicket", "ProjectTicket", "ChargeCode", "Activity"]).describe("What to charge the time to"),
       chargeToId: z.number().describe("ID of the ticket, charge code, or activity"),
@@ -86,7 +86,7 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
       emailContactFlag: z
         .boolean()
         .optional()
-        .describe("Email the ticket contact about this time entry. Default: false. Never true unless passed"),
+        .describe("Email the ticket contact about this time entry. Sent as false unless passed as true. ConnectWise may not keep it: the response reports a mismatch"),
       confirm: z
         .boolean()
         .optional()
@@ -210,14 +210,23 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
         throw err;
       }
 
+      // ConnectWise can answer with another emailContactFlag than the one sent. Say so, never assume it held.
+      const flagNote = (record: Record<string, unknown>) =>
+        record.emailContactFlag === body.emailContactFlag
+          ? {}
+          : {
+              emailContactFlag: { sent: body.emailContactFlag, readBack: record.emailContactFlag ?? null },
+              warning: `The entry was created, but ConnectWise holds emailContactFlag ${String(record.emailContactFlag)}, not the ${String(body.emailContactFlag)} that was sent. The ticket contact may be emailed.`,
+            };
+
       // Without a new option, the entry is returned as ConnectWise created it.
       if (billableOption === undefined && timeSheetId === undefined) {
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ ...result, ...flagNote(result) }, null, 2) }] };
       }
 
       const id = typeof result?.id === "number" ? result.id : undefined;
       if (id === undefined) {
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ ...result, ...flagNote(result) }, null, 2) }] };
       }
       const fresh = await client.get<Record<string, unknown>>(`/time/entries/${id}`);
       const verified: Record<string, boolean> = {};
@@ -227,7 +236,7 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
       }
       const ok = Object.values(verified).every(Boolean);
       return {
-        content: [{ type: "text", text: JSON.stringify({ ...fresh, verified }, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ ...fresh, verified, ...flagNote(fresh) }, null, 2) }],
         isError: !ok,
       };
     },
@@ -256,14 +265,60 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
 
   server.tool(
     "cw_delete_time_entry",
-    "Delete a time entry (Manage DELETE /time/entries/{id}). Use this to remove a mistaken entry before it is billed. Manage rejects deletes of entries that are already billed.",
+    "Delete a time entry (Manage DELETE /time/entries/{id}). Use this to remove a mistaken entry before it is billed. Requires confirm: true. Without it nothing is written and the entry that would be deleted is returned. After the delete the entry is read back, expecting it gone. Manage rejects deletes of entries that are already billed, and of entries on a time sheet that is not Open.",
     {
       id: z.number().describe("Time entry ID"),
+      confirm: z
+        .boolean()
+        .optional()
+        .describe("Must be true for the delete to happen. Omitted or false makes no write"),
     },
-    async ({ id }) => {
-      await client.delete(`/time/entries/${id}`);
+    { readOnlyHint: false, destructiveHint: true },
+    async ({ id, confirm }) => {
+      const path = `/time/entries/${id}`;
+      const entry = await client.get<Record<string, unknown>>(path);
+      const ref = (value: unknown) => {
+        const record = value as { id?: number; identifier?: string; name?: string } | null | undefined;
+        return record ? { id: record.id ?? null, name: record.name ?? record.identifier ?? null } : null;
+      };
+      const summary = {
+        id,
+        member: ref(entry.member),
+        company: ref(entry.company),
+        chargeToType: entry.chargeToType ?? null,
+        chargeToId: entry.chargeToId ?? null,
+        timeStart: entry.timeStart ?? null,
+        timeEnd: entry.timeEnd ?? null,
+        actualHours: entry.actualHours ?? null,
+        billableOption: entry.billableOption ?? null,
+        status: entry.status ?? null,
+        timeSheet: ref(entry.timeSheet),
+      };
+      if (confirm !== true) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { deleted: false, message: "No write was made. Pass confirm: true to delete this time entry.", entry: summary },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+      await client.delete(path);
+      let gone = false;
+      try {
+        await client.get(path);
+      } catch (err: unknown) {
+        gone = hasApiStatus(err, 404);
+      }
       return {
-        content: [{ type: "text", text: JSON.stringify({ id, deleted: true }, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ id, deleted: true, verified: gone, entry: summary }, null, 2) }],
+        isError: !gone,
       };
     },
   );

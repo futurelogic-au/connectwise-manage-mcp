@@ -94,7 +94,22 @@ interface FakeState {
   sideEffects?: Rec;
   /** Fields ConnectWise changes on the sheet when it is approved again. */
   sheetSideEffects?: Rec;
+  /** Make a sheet reject behave as the live server does: it needs a rejected entry and passes the rest. */
+  liveReject?: boolean;
 }
+
+const LIVE_REJECT_REFUSAL = {
+  code: "InvalidObject",
+  message: "timeSheet object is invalid",
+  errors: [
+    {
+      code: "InvalidObject",
+      message: "Period 42 / Stephan Jenner cannot be rejected: You must reject the incorrect time entries before rejecting the time sheet.",
+      resource: "timeSheet",
+      field: "id",
+    },
+  ],
+};
 
 function fakeConnectWise(state: FakeState) {
   const calls: Call[] = [];
@@ -125,7 +140,19 @@ function fakeConnectWise(state: FakeState) {
       }
       if (!state.ignoreAction?.includes(action)) {
         if (action === "approve") Object.assign(sheet, { status: "ApprovedByTierOne" }, state.sheetSideEffects ?? {});
-        if (action === "reject") sheet.status = "Rejected";
+        if (action === "reject") {
+          const onSheet = Object.values(state.entries ?? {}).filter((entry) => (entry.timeSheet as Rec | undefined)?.id === sheet.id);
+          if (state.liveReject && !onSheet.some((entry) => entry.status === "Rejected")) {
+            return jsonResponse(LIVE_REJECT_REFUSAL, 400);
+          }
+          sheet.status = "Rejected";
+          // Seen live: every entry that is not rejected is passed.
+          if (state.liveReject) {
+            for (const entry of onSheet) {
+              if (entry.status !== "Rejected") entry.status = entry.chargeToType === "ProjectTicket" ? "PendingProjectApproval" : "ReadyToBill";
+            }
+          }
+        }
         // Seen live: a reverse un-submits the sheet, and a submit takes no body.
         if (action === "reverse") sheet.status = "Open";
         if (action === "submit") sheet.status = "PendingApproval";
@@ -133,6 +160,24 @@ function fakeConnectWise(state: FakeState) {
       return jsonResponse({ success: true });
     }
     if (path === "/time/entries" && method === "GET") return list(Object.values(state.entries ?? {}));
+    if ((match = path.match(/^\/time\/entries\/(\d+)\/reject$/)) && method === "POST") {
+      const entry = state.entries?.[Number(match[1])];
+      if (!entry) return notFound();
+      if (state.failAction?.includes("entryReject")) return jsonResponse({ code: "InvalidObject", message: "No" }, 400);
+      // Seen live: a reject with no comment is refused, and the message names the field.
+      if (!(body as Rec | undefined)?.comment) {
+        return jsonResponse(
+          {
+            code: "InvalidObject",
+            message: "timeEntryTierUpdate object is invalid",
+            errors: [{ code: "MissingRequiredField", message: "The comment field is required.", resource: "timeEntryTierUpdate", field: "comment" }],
+          },
+          400,
+        );
+      }
+      if (!state.ignoreAction?.includes("entryReject")) entry.status = "Rejected";
+      return jsonResponse({ success: true });
+    }
     if ((match = path.match(/^\/time\/entries\/(\d+)$/))) {
       const entry = state.entries?.[Number(match[1])];
       if (!entry) return notFound();
@@ -207,15 +252,17 @@ describe("time sheet tools, registration", () => {
       expect(find(name).annotations, name).toMatchObject({ readOnlyHint: true });
       expect(find(name).inputSchema.properties, name).not.toHaveProperty("confirm");
     }
-    for (const name of ["cw_submit_time_sheet", "cw_approve_time_sheet", "cw_reject_time_sheet", "cw_reverse_time_sheet", "cw_edit_approved_time_entry"]) {
+    for (const name of ["cw_submit_time_sheet", "cw_approve_time_sheet", "cw_reject_time_sheet", "cw_reject_time_entry", "cw_reverse_time_sheet", "cw_edit_approved_time_entry"]) {
       expect(find(name), name).toBeDefined();
       expect(find(name).annotations, name).toMatchObject({ readOnlyHint: false, destructiveHint: true });
       expect(find(name).inputSchema.properties, name).toHaveProperty("confirm");
     }
     // D20: a reverse needs a reason. D19: no tool lets the caller pick an approval tier.
     expect(find("cw_reverse_time_sheet").inputSchema.required?.sort()).toEqual(["id", "reason"]);
+    // ConnectWise refuses an entry reject with no comment, so the reason is required.
+    expect(find("cw_reject_time_entry").inputSchema.required?.sort()).toEqual(["id", "reason"]);
     expect(find("cw_edit_approved_time_entry").inputSchema.required?.sort()).toEqual(["operations", "reason", "timeEntryId"]);
-    for (const tool of tools.filter((entry) => /time_sheet|approved_time_entry/.test(entry.name))) {
+    for (const tool of tools.filter((entry) => /time_sheet|approved_time_entry|reject_time_entry/.test(entry.name))) {
       expect(tool.inputSchema.properties, tool.name).not.toHaveProperty("approvalType");
     }
   });
@@ -365,6 +412,38 @@ describe("cw_submit_time_sheet", () => {
     expect(writes(cw.calls)).toEqual([]);
   });
 
+  it("carries the reject warning in the tool description, word for word", async () => {
+    const tools = (await mcp<{ tools: Array<ListedTool & { description: string }> }>("tools/list", {})).result.tools;
+    expect(tools.find((tool) => tool.name === "cw_reject_time_sheet")!.description).toContain(
+      "WARNING: Rejecting a sheet moves every entry not rejected to ReadyToBill (or PendingProjectApproval for project time), so reject every entry that needs fixing before the sheet.",
+    );
+  });
+
+  it("takes ErrorsCorrected as a good submit, which is what a Rejected sheet reads on the live server", async () => {
+    // Live on 14/10/2026: submitting Rejected sheet 13818 left it ErrorsCorrected, and the approve took it.
+    const state = sheet(900, { status: "Rejected" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init: RequestInit = {}) => {
+        if (init.method === "POST") {
+          state.status = state.status === "Rejected" ? "ErrorsCorrected" : "ApprovedByTierOne";
+          return jsonResponse({ success: true });
+        }
+        return jsonResponse(state);
+      }),
+    );
+    expect(json(await call("cw_submit_time_sheet", { id: 900, confirm: true }))).toMatchObject({
+      verified: true,
+      statusBefore: "Rejected",
+      statusAfter: "ErrorsCorrected",
+    });
+    expect(json(await call("cw_approve_time_sheet", { id: 900, confirm: true }))).toMatchObject({
+      verified: true,
+      statusBefore: "ErrorsCorrected",
+      statusAfter: "ApprovedByTierOne",
+    });
+  });
+
   it.each(["Open", "Rejected"])("submits a sheet that is %s with an empty body and reads PendingApproval back", async (status) => {
     const cw = fakeConnectWise({ sheets: { 900: sheet(900, { status }) } });
     const result = await call("cw_submit_time_sheet", { id: 900, confirm: true });
@@ -433,20 +512,94 @@ describe("cw_reject_time_sheet and cw_reverse_time_sheet (D20)", () => {
         },
       ],
     };
-    const state = sheet(900);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string | URL, init: RequestInit = {}) =>
-        init.method === "POST" ? jsonResponse(refusal, 400) : jsonResponse(state),
-      ),
-    );
+    expect(refusal).toEqual(LIVE_REJECT_REFUSAL);
+    const cw = fakeConnectWise({
+      sheets: { 900: sheet(900) },
+      entries: { 1: entry(1, { status: "PendingApproval" }) },
+      liveReject: true,
+    });
 
     const result = await call("cw_reject_time_sheet", { id: 900, reason: "Friday has no entries", confirm: true });
 
     expect(result.isError).toBe(true);
     const out = json(result);
     expect(out).toMatchObject({ saved: false, verified: false, refusal: "entries-not-rejected", statusAfter: "PendingApproval" });
-    expect(String(out.message)).toMatch(/reject the incorrect entries in Manage first/);
+    expect(String(out.message)).toMatch(/Pass the incorrect entries in rejectEntryIds, or reject them first with cw_reject_time_entry/);
+    expect(cw.state.entries![1].status).toBe("PendingApproval");
+  });
+
+  it("rejects the named entries first, with the reason as their comment, then the sheet", async () => {
+    const cw = fakeConnectWise({
+      sheets: { 900: sheet(900) },
+      entries: {
+        1: entry(1, { status: "PendingApproval" }),
+        2: entry(2, { status: "PendingApproval" }),
+        3: entry(3, { status: "PendingApproval", chargeToType: "ProjectTicket" }),
+      },
+      liveReject: true,
+    });
+
+    const result = await call("cw_reject_time_sheet", { id: 900, reason: "Wrong ticket", rejectEntryIds: [1], confirm: true });
+
+    expect(result.isError).not.toBe(true);
+    expect(json(result)).toMatchObject({
+      saved: true,
+      verified: true,
+      statusBefore: "PendingApproval",
+      statusAfter: "Rejected",
+      entries: [{ timeEntryId: 1, ok: true, statusBefore: "PendingApproval", statusAfter: "Rejected" }],
+      // Seen live: the entries that were not rejected are passed.
+      entryStatuses: { Rejected: 1, ReadyToBill: 1, PendingProjectApproval: 1 },
+    });
+    expect(sent(cw.calls)).toEqual(["POST /time/entries/1/reject", "POST /time/sheets/900/reject"]);
+    expect(writes(cw.calls)[0].body).toEqual({ approvalType: "Tier1Update", comment: "Wrong ticket" });
+    expect(writes(cw.calls)[1].body).toEqual({ approvalType: "Tier1Update" });
+  });
+
+  it("warns in the reject plan that the other entries will be passed, and lists the entry rejects", async () => {
+    const cw = fakeConnectWise({ sheets: { 900: sheet(900) }, entries: { 1: entry(1, { status: "PendingApproval" }) } });
+    const out = json(await call("cw_reject_time_sheet", { id: 900, reason: "Wrong ticket", rejectEntryIds: [1] })) as { planned: Rec };
+    expect(String((out as Rec).message)).toContain(
+      "Rejecting a sheet moves every entry not rejected to ReadyToBill (or PendingProjectApproval for project time), so reject every entry that needs fixing before the sheet.",
+    );
+    expect(out.planned).toEqual({
+      first: ["POST /time/entries/1/reject"],
+      call: "POST /time/sheets/900/reject",
+      approvalType: "Tier1Update",
+    });
+    expect(writes(cw.calls)).toEqual([]);
+  });
+
+  it("rejects no entry and no sheet when an entry is on another sheet", async () => {
+    const cw = fakeConnectWise({
+      sheets: { 900: sheet(900) },
+      entries: { 1: entry(1, { status: "PendingApproval", timeSheet: { id: 901 } }) },
+    });
+    const result = await call("cw_reject_time_sheet", { id: 900, reason: "Wrong ticket", rejectEntryIds: [1], confirm: true });
+    expect(result.isError).toBe(true);
+    expect(String(json(result).message)).toMatch(/Time entry 1 is not on time sheet 900/);
+    expect(writes(cw.calls)).toEqual([]);
+  });
+
+  it("needs a reason when entries are to be rejected, before any write", async () => {
+    const cw = fakeConnectWise({ sheets: { 900: sheet(900) }, entries: { 1: entry(1, { status: "PendingApproval" }) } });
+    const result = await call("cw_reject_time_sheet", { id: 900, rejectEntryIds: [1], confirm: true });
+    expect(result.isError).toBe(true);
+    expect(String(json(result).message)).toMatch(/needs a reason/);
+    expect(writes(cw.calls)).toEqual([]);
+  });
+
+  it("does not reject the sheet when an entry reject fails", async () => {
+    const cw = fakeConnectWise({
+      sheets: { 900: sheet(900) },
+      entries: { 1: entry(1, { status: "PendingApproval" }) },
+      failAction: ["entryReject"],
+    });
+    const result = await call("cw_reject_time_sheet", { id: 900, reason: "Wrong ticket", rejectEntryIds: [1], confirm: true });
+    expect(result.isError).toBe(true);
+    expect(json(result)).toMatchObject({ saved: false, verified: false, entries: [{ timeEntryId: 1, ok: false }] });
+    expect(sent(cw.calls)).toEqual(["POST /time/entries/1/reject"]);
+    expect(cw.state.sheets[900].status).toBe("PendingApproval");
   });
 
   it("gives no entries-not-rejected reason for another refusal, or on another action", async () => {
@@ -509,6 +662,141 @@ describe("cw_reject_time_sheet and cw_reverse_time_sheet (D20)", () => {
     const result = await call("cw_reverse_time_sheet", { id: 900, reason: "Test of the read back", confirm: true });
     expect(result.isError).toBe(true);
     expect(json(result)).toMatchObject({ verified: false, statusAfter: "ApprovedByTierOne" });
+  });
+});
+
+describe("cw_reject_time_entry", () => {
+  const submitted = (over: Partial<FakeState> = {}): FakeState => ({
+    sheets: { 900: sheet(900) },
+    entries: { 1: entry(1, { status: "PendingApproval" }) },
+    ...over,
+  });
+
+  it("writes nothing without confirm: true and plans the comment", async () => {
+    const cw = fakeConnectWise(submitted());
+    const result = await call("cw_reject_time_entry", { id: 1, reason: "Wrong ticket" });
+    expect(result.isError).toBe(true);
+    expect(json(result)).toMatchObject({
+      saved: false,
+      planned: { call: "POST /time/entries/1/reject", approvalType: "Tier1Update", comment: "Wrong ticket" },
+      timeEntryId: 1,
+      status: "PendingApproval",
+      timeSheet: { id: 900, status: "PendingApproval" },
+    });
+    expect(writes(cw.calls)).toEqual([]);
+  });
+
+  it("rejects the entry with the reason as its comment and reads Rejected back", async () => {
+    const cw = fakeConnectWise(submitted());
+    const result = await call("cw_reject_time_entry", { id: 1, reason: "Wrong ticket", confirm: true });
+    expect(result.isError).not.toBe(true);
+    expect(json(result)).toMatchObject({
+      saved: true,
+      verified: true,
+      timeEntryId: 1,
+      statusBefore: "PendingApproval",
+      statusAfter: "Rejected",
+      reason: "Wrong ticket",
+    });
+    expect(sent(cw.calls)).toEqual(["POST /time/entries/1/reject"]);
+    // The body the live server asked for: its 400 named comment as required.
+    expect(writes(cw.calls)[0].body).toEqual({ approvalType: "Tier1Update", comment: "Wrong ticket" });
+  });
+
+  it("needs a reason before any request", async () => {
+    const cw = fakeConnectWise(submitted());
+    expect((await call("cw_reject_time_entry", { id: 1, confirm: true })).isError).toBe(true);
+    expect((await call("cw_reject_time_entry", { id: 1, reason: "  ", confirm: true })).isError).toBe(true);
+    expect(cw.fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["Open", "Rejected", "ApprovedByTierOne"])("refuses an entry whose sheet is %s", async (status) => {
+    const cw = fakeConnectWise(submitted({ sheets: { 900: sheet(900, { status }) } }));
+    const result = await call("cw_reject_time_entry", { id: 1, reason: "Wrong ticket", confirm: true });
+    expect(result.isError).toBe(true);
+    expect(String(json(result).message)).toContain(`on a time sheet that is ${status}`);
+    expect(writes(cw.calls)).toEqual([]);
+  });
+
+  it("does not call an entry rejected when its status did not move", async () => {
+    fakeConnectWise(submitted({ ignoreAction: ["entryReject"] }));
+    const result = await call("cw_reject_time_entry", { id: 1, reason: "Wrong ticket", confirm: true });
+    expect(result.isError).toBe(true);
+    expect(json(result)).toMatchObject({ saved: false, verified: false, statusAfter: "PendingApproval" });
+  });
+});
+
+describe("cw_delete_time_entry", () => {
+  /** A fake that holds one entry and lets it be deleted. */
+  function oneEntry(over: { failDelete?: boolean; keep?: boolean } = {}) {
+    let record: Rec | null = entry(1, { status: "Open" });
+    const methods: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init: RequestInit = {}) => {
+        const method = String(init.method ?? "GET");
+        methods.push(method);
+        if (method === "DELETE") {
+          if (over.failDelete) return jsonResponse({ code: "InvalidObject", message: "Entry is billed" }, 400);
+          if (!over.keep) record = null;
+          return new Response(null, { status: 204 });
+        }
+        return record ? jsonResponse(record) : jsonResponse({ code: "NotFound", message: "Not found" }, 404);
+      }),
+    );
+    return { methods, exists: () => record !== null };
+  }
+
+  it("is a destructive write that takes confirm", async () => {
+    const tools = (await mcp<{ tools: ListedTool[] }>("tools/list", {})).result.tools;
+    const tool = tools.find((entry) => entry.name === "cw_delete_time_entry")!;
+    expect(tool.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    expect(Object.keys(tool.inputSchema.properties).sort()).toEqual(["confirm", "id"]);
+  });
+
+  it("deletes nothing without confirm: true and returns the entry that would go", async () => {
+    const cw = oneEntry();
+    const result = await call("cw_delete_time_entry", { id: 1 });
+    expect(result.isError).toBe(true);
+    expect(json(result)).toMatchObject({
+      deleted: false,
+      entry: {
+        id: 1,
+        member: { id: 147, name: "Stephan Jenner" },
+        company: { id: 250, name: "Future Logic" },
+        chargeToId: 904995,
+        actualHours: 0.75,
+        billableOption: "Billable",
+        status: "Open",
+        timeSheet: { id: 900 },
+      },
+    });
+    expect(cw.methods).toEqual(["GET"]);
+    expect(cw.exists()).toBe(true);
+  });
+
+  it("deletes with confirm: true and reads back that the entry is gone", async () => {
+    const cw = oneEntry();
+    const result = await call("cw_delete_time_entry", { id: 1, confirm: true });
+    expect(result.isError).not.toBe(true);
+    expect(json(result)).toMatchObject({ id: 1, deleted: true, verified: true, entry: { id: 1 } });
+    expect(cw.methods).toEqual(["GET", "DELETE", "GET"]);
+    expect(cw.exists()).toBe(false);
+  });
+
+  it("does not call an entry deleted when it is still there on the read back", async () => {
+    oneEntry({ keep: true });
+    const result = await call("cw_delete_time_entry", { id: 1, confirm: true });
+    expect(result.isError).toBe(true);
+    expect(json(result)).toMatchObject({ deleted: true, verified: false });
+  });
+
+  it("reports a refusal from ConnectWise and leaves the entry", async () => {
+    const cw = oneEntry({ failDelete: true });
+    const result = await call("cw_delete_time_entry", { id: 1, confirm: true });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/DELETE \/time\/entries\/1 returned 400/);
+    expect(cw.exists()).toBe(true);
   });
 });
 

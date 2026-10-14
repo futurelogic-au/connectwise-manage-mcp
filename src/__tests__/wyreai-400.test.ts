@@ -298,7 +298,10 @@ describe("WYREAI-400 tool wiring", () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(fakeResponse({ id: 8, actualHours: 0.25 }))
-      .mockResolvedValueOnce(fakeResponse(undefined, 204));
+      // The delete reads the entry first, deletes it, then reads it back and expects 404.
+      .mockResolvedValueOnce(fakeResponse({ id: 8, actualHours: 0.25 }))
+      .mockResolvedValueOnce(fakeResponse(undefined, 204))
+      .mockResolvedValueOnce(fakeResponse({ code: "NotFound", message: "Not found" }, 404));
     vi.stubGlobal("fetch", fetchMock);
 
     const updated = await mcp("tools/call", {
@@ -317,10 +320,10 @@ describe("WYREAI-400 tool wiring", () => {
 
     const deleted = await mcp("tools/call", {
       name: "cw_delete_time_entry",
-      arguments: { id: 8 },
+      arguments: { id: 8, confirm: true },
     });
-    const [, deleteInit] = fetchMock.mock.calls[1] as [string, { method: string }];
+    const [, deleteInit] = fetchMock.mock.calls[2] as [string, { method: string }];
     expect(deleteInit.method).toBe("DELETE");
-    expect(JSON.parse(toolText(deleted))).toEqual({ id: 8, deleted: true });
+    expect(JSON.parse(toolText(deleted))).toMatchObject({ id: 8, deleted: true, verified: true });
   });
 });

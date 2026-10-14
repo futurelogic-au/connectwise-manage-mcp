@@ -499,6 +499,33 @@ describe("cw_create_time_entry", () => {
     expect(posts).toEqual([false, false, true]);
   });
 
+  it("reports an emailContactFlag ConnectWise did not keep, as seen live, and does not claim it held", async () => {
+    // Live on 14/10/2026: sent false on CW 904995, and the entry came back true.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init: RequestInit = {}) =>
+        init.method === "POST"
+          ? jsonResponse({ id: 800, ...(JSON.parse(String(init.body)) as Rec), emailContactFlag: true })
+          : jsonResponse({ id: 77, closedFlag: false }),
+      ),
+    );
+
+    const result = await call("cw_create_time_entry", entry);
+
+    const out = body(result);
+    expect(out).toMatchObject({ id: 800, emailContactFlag: { sent: false, readBack: true } });
+    expect(String(out.warning)).toMatch(/holds emailContactFlag true, not the false that was sent/);
+  });
+
+  it("gives no warning when ConnectWise keeps the emailContactFlag that was sent", async () => {
+    fakeConnectWise({ serviceTickets: openTicket });
+
+    const out = body(await call("cw_create_time_entry", entry));
+
+    expect(out).toMatchObject({ id: 800, emailContactFlag: false });
+    expect(out).not.toHaveProperty("warning");
+  });
+
   it("shows emailContactFlag false in the plan when it is not passed", async () => {
     fakeConnectWise({ serviceTickets: openTicket });
     const { confirm: _confirm, ...noConfirm } = entry as Rec;
