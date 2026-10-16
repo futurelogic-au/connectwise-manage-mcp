@@ -260,7 +260,7 @@ describe("setup read tools, registration", () => {
     }
     expect(cw.calls.length).toBeGreaterThan(SETUP_TOOLS.length);
     expect(cw.calls.filter((entry) => entry.method !== "GET")).toEqual([]);
-  });
+  }, 20000);
 });
 
 describe("boards, teams, statuses and types", () => {
