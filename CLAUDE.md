@@ -31,7 +31,8 @@ Domain contracts:
 - One branch and one pull request per numbered item or group. Never merge, never force-push main.
 - Every write tool takes confirm: true and reads the record back after the write.
 - Every delete refuses a done record or one with time against it, and writes an internal CW ticket note naming what went and why.
-- No delete tool on ticket tasks, expense entries or setup tables. No write tool on setup tables.
+- No delete tool on ticket tasks, expense entries or setup tables. No write tool on setup tables, except the named board item and subtype tools below.
+- Setup-table write exception, ruled by Stephan on 09/11/2026. Reason: Ticket Categorisation (CW 908802) needs confirm-gated item, subtype and type-link writes for its TSI changes. Allowed: cw_create_board_item, cw_update_board_item and cw_update_board_subtype (its type links included). Each takes confirm: true, returns the plan and a before-image without it, and reads the record back after the write. There is no delete tool for items or subtypes. The type, subtype and item association collection is GET only in the ConnectWise contract (2026.11), so it has no write tool. Any other setup-table write still needs a new ruling recorded here. The test in setup-reads.test.ts enforces this list.
 - Lean shape: id, summary, board, status, owner, company, _info.lastUpdated.
 - Errors returned to the caller carry status and a reference id only, never the upstream body, a key or a token.
 - TLS checking stays on by default. Never set NODE_TLS_REJECT_UNAUTHORIZED. Never widen the ConnectWise URL allowlist to pass a test.

@@ -179,11 +179,15 @@ To add time to an approved sheet: reverse it, create the entry, submit it and ap
 - `cw_list_statuses` — List statuses for a board
 
 ### Setup (read-only)
-These tools read the setup that decides where a service ticket lands and who owns it. There is no create, update or delete tool for any setup table.
+These tools read the setup that decides where a service ticket lands and who owns it. There is no create, update or delete tool for any setup table, with one exception: the board item and subtype tools below (ruled 09/11/2026 for Ticket Categorisation, CW 908802).
 - `cw_get_board`: One service board, as the full record, with its auto-assign resources
 - `cw_list_board_teams` / `cw_get_board_team`: Board teams, each with its default flag, its team leader and its members named
 - `cw_list_board_statuses` / `cw_get_board_status`: Board statuses with the closed, inactive and escalation flags. The list reads all pages, in sort order
 - `cw_list_board_types` / `cw_get_board_type` / `cw_get_board_subtype`: Ticket types and subtypes on a board. A subtype lists the types it can be used with
+- `cw_list_board_items`: Every item on a board with id, name and inactiveFlag, plus the active and inactive counts. `includeInactive` defaults to true. Reads all pages
+- `cw_list_board_item_associations`: Every type, subtype and item association on a board, each side as id and name. Reads all pages
+- `cw_list_item_associations`: The association records of one item (`/items/{id}/associations`), each as ConnectWise holds it: id, `subTypeAssociationIds`, `addAllSubTypesFlag` and `removeAllSubTypesFlag`. Reads all pages
+- `cw_create_board_item` / `cw_update_board_item` / `cw_update_board_subtype`: The only setup-table writes. Each needs `confirm: true`; without it nothing is written and the plan is returned with the before-image. After a write the record is read back and any field ConnectWise did not keep is reported as a mismatch. An item takes a name and `inactiveFlag`. A subtype takes a name, `inactiveFlag` and type links as `addTypeIds` and `removeTypeIds`. There is no delete tool for items or subtypes, and no write tool for the association collection, which is GET only in the ConnectWise contract
 - `cw_list_workflow_rules` / `cw_get_workflow_rule`: Workflow rules, filtered by board or to active rules. The get returns every event with its condition and every action under it
 - `cw_list_email_connectors` / `cw_get_email_connector`: Email connectors with the board each files to, its default member and its overrides. The get returns the parsing styles and the mail-handling rules under each
 - `cw_list_slas` / `cw_get_sla`: SLAs. The get returns the per-priority targets

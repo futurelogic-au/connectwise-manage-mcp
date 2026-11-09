@@ -128,6 +128,25 @@ function toLeanSubtype(subtype: CwRecord): CwRecord {
   };
 }
 
+/** A board item, as id, name and whether it is switched off. */
+function toLeanBoardItem(item: CwRecord): CwRecord {
+  return {
+    id: item.id ?? null,
+    name: item.name ?? null,
+    inactiveFlag: item.inactiveFlag === true,
+  };
+}
+
+/** One type, subtype and item link on a board, each side as id and name. */
+function toLeanItemAssociation(association: CwRecord): CwRecord {
+  return {
+    id: association.id ?? null,
+    type: toRef(association.type),
+    subType: toRef(association.subType),
+    item: toRef(association.item),
+  };
+}
+
 function toLeanWorkflowRule(rule: CwRecord): CwRecord {
   return {
     id: rule.id ?? null,
@@ -945,6 +964,76 @@ export function registerSetupTools(server: McpServer, client: CwManageClient) {
     SETUP_READ_ONLY,
     async ({ boardId, subtypeId }) =>
       jsonContent(await client.get(`/service/boards/${boardId}/subtypes/${subtypeId}`)),
+  );
+
+  server.tool(
+    "cw_list_board_items",
+    "List every item on a service board (GET /service/boards/{id}/items): id, name and inactiveFlag. Reads all pages. Returns the count, and the active and inactive counts of the items returned. Use cw_list_board_item_associations to see which type and subtype each item is linked to. Read-only.",
+    {
+      boardId: z.number().int().positive().describe("Service board ID"),
+      includeInactive: z
+        .boolean()
+        .optional()
+        .describe("Include inactive items (default: true)"),
+    },
+    SETUP_READ_ONLY,
+    async ({ boardId, includeInactive }) => {
+      const records = await fetchAllPages<CwRecord>(client, `/service/boards/${boardId}/items`);
+      const items = records
+        .map(toLeanBoardItem)
+        .filter((item) => includeInactive !== false || item.inactiveFlag !== true);
+      const inactiveCount = items.filter((item) => item.inactiveFlag === true).length;
+      return jsonContent({
+        boardId,
+        count: items.length,
+        activeCount: items.length - inactiveCount,
+        inactiveCount,
+        items,
+      });
+    },
+  );
+
+  server.tool(
+    "cw_list_board_item_associations",
+    "List every type, subtype and item association on a service board (GET /service/boards/{id}/typeSubTypeItemAssociations). Each row carries the association id and the type, subType and item it links, each as id and name. Reads all pages. Read-only.",
+    { boardId: z.number().int().positive().describe("Service board ID") },
+    SETUP_READ_ONLY,
+    async ({ boardId }) => {
+      const records = await fetchAllPages<CwRecord>(
+        client,
+        `/service/boards/${boardId}/typeSubTypeItemAssociations`,
+      );
+      return jsonContent({
+        boardId,
+        count: records.length,
+        associations: records.map(toLeanItemAssociation),
+      });
+    },
+  );
+
+  server.tool(
+    "cw_list_item_associations",
+    "List the association records of one item on a service board (GET /service/boards/{boardId}/items/{itemId}/associations). Each record is returned as ConnectWise holds it: id, subTypeAssociationIds, addAllSubTypesFlag and removeAllSubTypesFlag. A field ConnectWise does not send is left out, never filled in. Reads all pages. Read-only.",
+    {
+      boardId: z.number().int().positive().describe("Service board ID"),
+      itemId: z.number().int().positive().describe("Board item ID, from cw_list_board_items"),
+    },
+    SETUP_READ_ONLY,
+    async ({ boardId, itemId }) => {
+      const records = await fetchAllPages<CwRecord>(
+        client,
+        `/service/boards/${boardId}/items/${itemId}/associations`,
+      );
+      return jsonContent({
+        boardId,
+        itemId,
+        count: records.length,
+        associations: records.map((record) => ({
+          id: record.id ?? null,
+          ...pick(record, ["subTypeAssociationIds", "addAllSubTypesFlag", "removeAllSubTypesFlag"]),
+        })),
+      });
+    },
   );
 
   server.tool(
