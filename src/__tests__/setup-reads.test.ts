@@ -110,6 +110,9 @@ const SETUP_TOOLS = [
   "cw_list_board_types",
   "cw_get_board_type",
   "cw_get_board_subtype",
+  "cw_list_board_items",
+  "cw_list_board_item_associations",
+  "cw_list_item_associations",
   "cw_list_workflow_rules",
   "cw_get_workflow_rule",
   "cw_list_email_connectors",
@@ -209,14 +212,51 @@ describe("setup read tools, registration", () => {
     }
   });
 
-  it("registers no write tool on a setup table", async () => {
+  // The setup-table write rule in CLAUDE.md. Ruled by Stephan on 09/11/2026 for
+  // Ticket Categorisation (CW 908802): only these tools may write to a setup table.
+  const ALLOWED_SETUP_WRITES = ["cw_create_board_item", "cw_update_board_item", "cw_update_board_subtype"];
+
+  it("registers only the named write tools on a setup table", async () => {
     const tools = (await mcp<{ tools: ListedTool[] }>("tools/list", {})).result.tools;
     const writes = tools
       .map((tool) => tool.name)
       .filter((name) =>
-        /^cw_(create|update|delete|add|remove)_.*(board|workflow|email_connector|sla|status|team)/.test(name),
+        /^cw_(create|update|delete|add|remove)_.*(board|subtype|item_association|workflow|email_connector|sla|status|team)/.test(name),
       );
-    expect(writes).toEqual([]);
+    expect(writes.sort()).toEqual(ALLOWED_SETUP_WRITES);
+  });
+
+  it("gates every setup-table write on confirm, and marks it as a write", async () => {
+    const tools = (await mcp<{ tools: ListedTool[] }>("tools/list", {})).result.tools;
+    for (const name of ALLOWED_SETUP_WRITES) {
+      const tool = tools.find((entry) => entry.name === name);
+      expect(tool, name).toBeDefined();
+      expect(tool!.inputSchema.properties, name).toHaveProperty("confirm");
+      expect(tool!.inputSchema.required ?? [], name).not.toContain("confirm");
+      expect(tool!.annotations?.readOnlyHint, name).toBe(false);
+    }
+  });
+
+  it("registers no delete tool for an item, a subtype or any setup table", async () => {
+    const tools = (await mcp<{ tools: ListedTool[] }>("tools/list", {})).result.tools;
+    const deletes = tools
+      .map((tool) => tool.name)
+      .filter((name) => /^cw_(delete|remove)_.*(board|subtype|item_association|workflow|email_connector|sla|status|team)/.test(name));
+    expect(deletes).toEqual([]);
+  });
+
+  it("sends no write from an allowed setup-table tool called without confirm", async () => {
+    const cw = fakeConnectWise({
+      "/service/boards/5/items": [{ id: 1, name: "Printer", inactiveFlag: false, board: { id: 5 } }],
+      "/service/boards/5/items/1": { id: 1, name: "Printer", inactiveFlag: false, board: { id: 5 } },
+      "/service/boards/5/subtypes/2": { id: 2, name: "Hardware", inactiveFlag: false, typeAssociationIds: [], board: { id: 5 } },
+      "/service/boards/5/types": [{ id: 1, name: "Incident" }],
+    });
+    await call("cw_create_board_item", { boardId: 5, name: "Scanner" });
+    await call("cw_update_board_item", { boardId: 5, itemId: 1, inactiveFlag: true });
+    await call("cw_update_board_subtype", { boardId: 5, subtypeId: 2, addTypeIds: [1] });
+    expect(cw.calls.length).toBeGreaterThan(0);
+    expect(cw.calls.filter((entry) => entry.method !== "GET")).toEqual([]);
   });
 
   it("sends only GET requests from every setup tool", async () => {
@@ -229,6 +269,9 @@ describe("setup read tools, registration", () => {
         "/service/boards/5/types/1": { id: 1 },
         "/service/boards/5/subtypes": [],
         "/service/boards/5/subtypes/2": { id: 2 },
+        "/service/boards/5/items": [],
+        "/service/boards/5/typeSubTypeItemAssociations": [],
+        "/service/boards/5/items/1/associations": [],
         "/system/workflows/21": { id: 21, name: "Assign new tickets" },
         "/system/emailConnectors/3": { id: 3 },
         "/system/emailConnectors/3/parsingStyles": [],
@@ -246,6 +289,9 @@ describe("setup read tools, registration", () => {
       cw_list_board_types: { boardId: 5 },
       cw_get_board_type: { boardId: 5, typeId: 1 },
       cw_get_board_subtype: { boardId: 5, subtypeId: 2 },
+      cw_list_board_items: { boardId: 5 },
+      cw_list_board_item_associations: { boardId: 5 },
+      cw_list_item_associations: { boardId: 5, itemId: 1 },
       cw_list_workflow_rules: {},
       cw_get_workflow_rule: { id: 21 },
       cw_list_email_connectors: {},
@@ -366,6 +412,187 @@ describe("boards, teams, statuses and types", () => {
       subtypes: [{ id: 2, name: "Printer", inactiveFlag: true, typeAssociationIds: [1] }],
     });
     expect(cw.calls.map((entry) => entry.path)).toEqual(["/service/boards/5/types", "/service/boards/5/subtypes"]);
+  });
+
+  const boardItems = [
+    { id: 11, name: "Printer", inactiveFlag: false, board: { id: 1, name: "Incident Board" }, parentId: 2 },
+    { id: 12, name: "Old VPN", inactiveFlag: true, board: { id: 1, name: "Incident Board" } },
+    { id: 13, name: "Mailbox", board: { id: 1, name: "Incident Board" } },
+  ];
+
+  it("cw_list_board_items returns id, name and inactiveFlag with the active and inactive counts", async () => {
+    const cw = fakeConnectWise({ "/service/boards/1/items": boardItems });
+    const out = json(await call("cw_list_board_items", { boardId: 1 }));
+    expect(out).toEqual({
+      boardId: 1,
+      count: 3,
+      activeCount: 2,
+      inactiveCount: 1,
+      items: [
+        { id: 11, name: "Printer", inactiveFlag: false },
+        { id: 12, name: "Old VPN", inactiveFlag: true },
+        { id: 13, name: "Mailbox", inactiveFlag: false },
+      ],
+    });
+    expect(cw.calls).toHaveLength(1);
+    expect(cw.calls[0]).toMatchObject({ method: "GET", path: "/service/boards/1/items" });
+  });
+
+  it("cw_list_board_items leaves out inactive items only when asked", async () => {
+    fakeConnectWise({ "/service/boards/1/items": boardItems });
+    const out = json(await call("cw_list_board_items", { boardId: 1, includeInactive: false })) as {
+      count: number;
+      activeCount: number;
+      inactiveCount: number;
+      items: Array<{ id: number }>;
+    };
+    expect(out.items.map((item) => item.id)).toEqual([11, 13]);
+    expect([out.count, out.activeCount, out.inactiveCount]).toEqual([2, 2, 0]);
+  });
+
+  it("cw_list_board_items and cw_list_board_item_associations read every page", async () => {
+    const pageOne = (prefix: string) => Array.from({ length: 1000 }, (_, i) => ({ id: i + 1, name: `${prefix}${i}` }));
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const parsed = new URL(String(url));
+        const path = parsed.pathname.replace("/v4_6_release/apis/3.0", "");
+        const page = parsed.searchParams.get("page");
+        seen.push(`${path}?page=${page}&pageSize=${parsed.searchParams.get("pageSize")}`);
+        if (page === "1") return jsonResponse(pageOne("n"));
+        if (page === "2") return jsonResponse([{ id: 2001, name: "last", inactiveFlag: true }]);
+        return jsonResponse([]);
+      }),
+    );
+    const items = json(await call("cw_list_board_items", { boardId: 1 })) as { count: number; inactiveCount: number };
+    expect(items.count).toBe(1001);
+    expect(items.inactiveCount).toBe(1);
+    const links = json(await call("cw_list_board_item_associations", { boardId: 1 })) as { count: number };
+    expect(links.count).toBe(1001);
+    expect(seen).toEqual([
+      "/service/boards/1/items?page=1&pageSize=1000",
+      "/service/boards/1/items?page=2&pageSize=1000",
+      "/service/boards/1/typeSubTypeItemAssociations?page=1&pageSize=1000",
+      "/service/boards/1/typeSubTypeItemAssociations?page=2&pageSize=1000",
+    ]);
+  });
+
+  it("cw_list_board_item_associations returns each link with the ids and names of its type, subtype and item", async () => {
+    const cw = fakeConnectWise({
+      "/service/boards/1/typeSubTypeItemAssociations": [
+        {
+          id: 901,
+          type: { id: 1, name: "Incident", _info: { type_href: "https://example.test/t" } },
+          subType: { id: 2, name: "Printer" },
+          item: { id: 11, name: "Offline" },
+          board: { id: 1, name: "Incident Board" },
+          _info: { lastUpdated: "2026-10-01T01:00:00Z" },
+        },
+        { id: 902, type: { id: 1, name: "Incident" }, item: { id: 12, name: "Slow" } },
+      ],
+    });
+    const out = json(await call("cw_list_board_item_associations", { boardId: 1 }));
+    expect(out).toEqual({
+      boardId: 1,
+      count: 2,
+      associations: [
+        {
+          id: 901,
+          type: { id: 1, name: "Incident" },
+          subType: { id: 2, name: "Printer" },
+          item: { id: 11, name: "Offline" },
+        },
+        { id: 902, type: { id: 1, name: "Incident" }, subType: null, item: { id: 12, name: "Slow" } },
+      ],
+    });
+    expect(cw.calls).toHaveLength(1);
+    expect(cw.calls[0]).toMatchObject({ method: "GET", path: "/service/boards/1/typeSubTypeItemAssociations" });
+  });
+
+  it("cw_list_item_associations returns each record as ConnectWise holds it, and nothing it did not send", async () => {
+    const cw = fakeConnectWise({
+      "/service/boards/1/items/11/associations": [
+        {
+          id: 31,
+          subTypeAssociationIds: [2, 3],
+          addAllSubTypesFlag: false,
+          removeAllSubTypesFlag: false,
+          item: { id: 11, name: "Printer" },
+          board: { id: 1, name: "Incident Board" },
+          _info: { lastUpdated: "2026-10-01T01:00:00Z" },
+        },
+        { id: 32, subTypeAssociationIds: [], addAllSubTypesFlag: true },
+        { id: 33 },
+      ],
+    });
+    const out = json(await call("cw_list_item_associations", { boardId: 1, itemId: 11 }));
+    expect(out).toEqual({
+      boardId: 1,
+      itemId: 11,
+      count: 3,
+      associations: [
+        { id: 31, subTypeAssociationIds: [2, 3], addAllSubTypesFlag: false, removeAllSubTypesFlag: false },
+        { id: 32, subTypeAssociationIds: [], addAllSubTypesFlag: true },
+        { id: 33 },
+      ],
+    });
+    expect(cw.calls).toHaveLength(1);
+    expect(cw.calls[0]).toMatchObject({ method: "GET", path: "/service/boards/1/items/11/associations" });
+  });
+
+  it("cw_list_item_associations reads every page", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const parsed = new URL(String(url));
+        const page = parsed.searchParams.get("page");
+        seen.push(`${parsed.pathname.replace("/v4_6_release/apis/3.0", "")}?page=${page}`);
+        if (page === "1") return jsonResponse(Array.from({ length: 1000 }, (_, i) => ({ id: i + 1, subTypeAssociationIds: [i] })));
+        if (page === "2") return jsonResponse([{ id: 5000, subTypeAssociationIds: [] }]);
+        return jsonResponse([]);
+      }),
+    );
+    const out = json(await call("cw_list_item_associations", { boardId: 1, itemId: 11 })) as { count: number };
+    expect(out.count).toBe(1001);
+    expect(seen).toEqual([
+      "/service/boards/1/items/11/associations?page=1",
+      "/service/boards/1/items/11/associations?page=2",
+    ]);
+  });
+
+  it("cw_list_item_associations refuses a bad id before any request and hides an upstream body", async () => {
+    const cw = fakeConnectWise({});
+    for (const args of [{ boardId: 0, itemId: 1 }, { boardId: 1, itemId: -1 }, { boardId: 1, itemId: 1.5 }, { boardId: "1", itemId: 1 }]) {
+      expect((await call("cw_list_item_associations", args)).isError).toBe(true);
+    }
+    expect(cw.fetchMock).not.toHaveBeenCalled();
+    fakeConnectWise({ "/service/boards/1/items/11/associations": 403 });
+    const result = await call("cw_list_item_associations", { boardId: 1, itemId: 11 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/returned 403 \(reference /);
+    expect(result.content[0].text).not.toContain("SECRET");
+  });
+
+  it("the board item tools refuse a board id that is not a positive whole number before any request", async () => {
+    const cw = fakeConnectWise({});
+    for (const name of ["cw_list_board_items", "cw_list_board_item_associations"]) {
+      for (const boardId of [0, -1, 1.5, "1"]) {
+        expect((await call(name, { boardId })).isError, `${name} ${boardId}`).toBe(true);
+      }
+    }
+    expect(cw.fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("the board item tools report an upstream failure with the status and a reference, never the body", async () => {
+    fakeConnectWise({ "/service/boards/1/items": 403, "/service/boards/1/typeSubTypeItemAssociations": 403 });
+    for (const name of ["cw_list_board_items", "cw_list_board_item_associations"]) {
+      const result = await call(name, { boardId: 1 });
+      expect(result.isError, name).toBe(true);
+      expect(result.content[0].text, name).toMatch(/returned 403 \(reference /);
+      expect(result.content[0].text, name).not.toContain("SECRET");
+    }
   });
 
   it("refuses a board id that is not a positive whole number before any request", async () => {
