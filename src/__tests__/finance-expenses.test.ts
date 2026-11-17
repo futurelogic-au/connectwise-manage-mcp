@@ -395,12 +395,39 @@ describe("expense tools", () => {
       );
     });
 
-    it("refuses another member's id and reads nothing", async () => {
+    it("searches another member's claims with memberId (D23 revised 17/11/2026)", async () => {
       const cw = fakeConnectWise({ entries });
       const result = await call("cw_search_expense_entries", { memberId: 99 });
+      expect(result.isError).not.toBe(true);
+      expect((body(result) as { entries: Rec[] }).entries.map((e) => e.id)).toEqual([3]);
+      expect(body(result).memberId).toBe(99);
+      const search = cw.calls.find((c) => c.path === "/expense/entries")!;
+      expect(search.query.get("conditions")).toBe("member/id = 99");
+    });
+
+    it("searches another member's claims by identifier, with no CW_MANAGE_MEMBER_ID needed", async () => {
+      vi.stubEnv("CW_MANAGE_MEMBER_ID", "");
+      const cw = fakeConnectWise({ entries });
+      const result = await call("cw_search_expense_entries", { memberIdentifier: "esmith", dateFrom: "2026-10-05" });
+      expect(result.isError).not.toBe(true);
+      const search = cw.calls.find((c) => c.path === "/expense/entries")!;
+      expect(search.query.get("conditions")).toBe("member/identifier = 'esmith' and date >= [2026-10-05T00:00:00Z]");
+    });
+
+    it("refuses an identifier that could break out of the condition, before any request", async () => {
+      const cw = fakeConnectWise({ entries });
+      const result = await call("cw_search_expense_entries", { memberIdentifier: "x' or id>0 or 'a'='a" });
       expect(result.isError).toBe(true);
-      expect(String(body(result).message)).toMatch(/D23/);
-      expect(cw.calls.some((c) => c.path === "/expense/entries")).toBe(false);
+      expect(cw.fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("returns ConnectWise's refusal when the keys cannot see that member, and does not work around it", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => jsonResponse({ code: "Forbidden", message: "Access denied" }, 403)),
+      );
+      const result = await call("cw_search_expense_entries", { memberId: 99 });
+      expect(result.isError).toBe(true);
     });
 
     it("returns the company on each lean row, so existing claims can be checked", async () => {
@@ -423,12 +450,12 @@ describe("expense tools", () => {
       expect(body(result).count).toBe(2);
     });
 
-    it("refuses a member id that differs from CW_MANAGE_MEMBER_ID, without reading", async () => {
-      vi.stubEnv("CW_MANAGE_MEMBER_ID", "20");
+    it("still refuses with no filter when CW_MANAGE_MEMBER_ID is unset, and reads nothing", async () => {
+      vi.stubEnv("CW_MANAGE_MEMBER_ID", "");
       const cw = fakeConnectWise({ entries });
-      const result = await call("cw_search_expense_entries", { memberId: 21 });
+      const result = await call("cw_search_expense_entries", {});
       expect(result.isError).toBe(true);
-      expect(String(body(result).message)).toMatch(/not the member in CW_MANAGE_MEMBER_ID/);
+      expect(String(body(result).message)).toMatch(/CW_MANAGE_MEMBER_ID/);
       expect(cw.fetchMock).not.toHaveBeenCalled();
     });
   });
