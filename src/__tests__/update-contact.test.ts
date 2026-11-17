@@ -117,7 +117,7 @@ describe("cw_update_contact", () => {
         "cw_close_adjustment",
       ]),
     );
-    expect(names).toHaveLength(139);
+    expect(names).toHaveLength(145);
   });
 
   it("patches name, title, site, inactive flag, communication items, and custom fields", async () => {

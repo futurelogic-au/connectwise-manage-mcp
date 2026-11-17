@@ -46,14 +46,14 @@ For deploying to **Azure Container Apps** with Entra ID OAuth 2.1, see [AZURE_AC
 
 ### Per-person settings for expense claims
 
-The expense tools are limited to your own claims. Set these in the `env` block of your own connector entry, on your own machine:
+Creating a claim and attaching a receipt are limited to your own claims, and a search returns your own claims unless you pass a member filter. Set these in the `env` block of your own connector entry, on your own machine:
 
 ```json
 "CW_MANAGE_MEMBER_ID": "your-member-id"
 ```
 
-- **`CW_MANAGE_MEMBER_ID` is per person.** It is your own ConnectWise member id, a whole number above zero. Every expense search, claim and receipt uses it as the member. It is never shared and never read from a request.
-- **Unset, the expense tools refuse.** `cw_search_expense_entries`, `cw_create_expense_entry` and `cw_attach_document` return a message that names the variable, and read and write nothing. A `memberId` argument that differs from it is refused.
+- **`CW_MANAGE_MEMBER_ID` is per person.** It is your own ConnectWise member id, a whole number above zero. Every claim and receipt uses it as the member, and so does a search with no member filter. It is never shared and never read from a request.
+- **Unset, the expense tools refuse.** `cw_search_expense_entries`, `cw_create_expense_entry` and `cw_attach_document` return a message that names the variable, and read and write nothing. A search that passes `memberId` or `memberIdentifier` does not need it.
 - **The connector does not look the member up.** `GET /system/myAccount` answers 404 on ConnectWise v2025.1, so the id comes from this variable and nowhere else.
 - **Use it on a per-person install.** One process with one member id serves one person. Do not rely on the expense tools in a shared gateway deployment, where one process serves many callers.
 - `CW_MANAGE_ATTACH_ROOT`, in the table above, is set the same way, per person in each connector entry.
@@ -157,6 +157,15 @@ A time sheet is one member's time for one Saturday to Friday period (`/time/shee
 
 To add time to an approved sheet: reverse it, create the entry, submit it and approve it. ConnectWise takes new time only on a sheet that is Open.
 
+### Expense Reports
+An expense report is one member's group of expense entries sent for approval (`/expense/reports`). Unlike the claim tools above, the report tools read and decide **any member's** report, so the approver can review claims. Every write needs `confirm: true`, checks the status first and reads the report and its entries back. Tier one only: no tool takes an approval type. There is no delete tool and no tool that edits a report or an entry (PATCH and PUT on a report answer 405, and there is no entry reject in ConnectWise).
+- `cw_search_expense_reports`: Search reports, lean. Filter by member, status or the date the period starts
+- `cw_get_expense_report`: One report with its entries and a count of the entries by status
+- `cw_approve_expense_report`: Approve a `PendingApproval` or `ErrorsCorrected` report at tier one. A good approval reads `ApprovedByTierOne`
+- `cw_reject_expense_report`: Reject a `PendingApproval` or `ErrorsCorrected` report so the engineer gets the rejection notice. Needs a `reason`, sent to ConnectWise as the reject comment. The result reads the report and every entry back, with entry counts by status before and after. A good reject reads `Rejected`. Whether the reason shows in the engineer's notice is checked on the first live reject
+- `cw_submit_expense_report`: Submit an `Open` or `Rejected` report, for example to restore a report to `PendingApproval`
+- `cw_reverse_expense_report`: Reverse a tier one approval. Needs a `reason`. Only an `ApprovedByTierOne` report is reversed: any other status is refused before ConnectWise is called, because a reverse moved a `PendingApproval` report back to `Open` on our instance
+
 ### Schedule Entries
 - `cw_search_schedule_entries` — Search booked resource time
 - `cw_list_schedule_types` — List schedule types (Service, Project, Sales, Meeting)
@@ -229,7 +238,7 @@ ConnectWise exposes additions only as children of a single agreement, with no cr
 ### Expenses
 - `cw_list_expense_types`: List expense types (inactive left out unless asked), with the ID the claim needs
 - `cw_list_charge_codes`: List charge codes, for the `chargeCodeId` on a claim
-- `cw_search_expense_entries`: Search the owner's own expense entries by date range and amount. Each row carries the entry's company. The member is your own, from `CW_MANAGE_MEMBER_ID`; another member's ID is refused, and with the variable unset nothing is read
+- `cw_search_expense_entries`: Search expense entries by date range and amount. With no member filter it returns your own claims, from `CW_MANAGE_MEMBER_ID`. With `memberId` or `memberIdentifier` it returns that member's claims, so an approver can review them (D23, revised 17/11/2026). ConnectWise member security decides what your keys can see, and a 403 is returned as it came. Each row carries the entry's company
 - `cw_create_expense_entry`: Create one expense entry for the owner. `expenseTypeId` is required with no default. Every claim needs a charge-to: pass exactly one of `chargeCodeId` and `companyId`, with no default (neither, or both, is refused). A company is sent as the entry's company reference. `merchant` is required and written at the start of the notes (merchant `Ampol` with notes `Petrol` is stored as `Ampol, Petrol`). A duplicate check on date, amount and merchant runs first and a match is refused. Needs `confirm: true` and reads the entry back. There is no expense delete tool
 - `cw_attach_document`: Attach a receipt (`.pdf`, `.png`, `.jpg`, `.jpeg`, at most 10 MiB) to one of the owner's expense entries through `POST /system/documents`. The file is read from disk under `CW_MANAGE_ATTACH_ROOT` and is never moved, renamed or filed. Needs `confirm: true`, skips a file already on the entry, and reads the entry's documents back. If ConnectWise answers an upload with a document that was already on the entry, the response is `attached: false` and names that document
 

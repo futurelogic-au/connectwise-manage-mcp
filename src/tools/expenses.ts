@@ -7,7 +7,10 @@ import { fetchAllPages } from "./paging.js";
 /**
  * Expense claims and receipts (rulings D22 to D24).
  *
- * - Own claims only (D23). The member is never a free choice: it is the
+ * - Claims are the owner's own by default (D23, revised 17/11/2026). Create and
+ *   attach stay own-only. Search takes an optional member filter so an approver
+ *   can read another member's claims; ConnectWise member security decides what
+ *   the keys can see. With no filter the member is the
  *   member id in CW_MANAGE_MEMBER_ID, set per person in that person's own
  *   connector entry. Unset, the expense tools refuse. (GET /system/myAccount
  *   answers 404 on ConnectWise v2025.1, so it is not used anywhere.)
@@ -197,14 +200,20 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
 
   server.tool(
     "cw_search_expense_entries",
-    "Search the owner's own expense entries (GET /expense/entries). Own claims only: the member is the owner's member id from the CW_MANAGE_MEMBER_ID environment variable, a different memberId is refused, and with the variable unset nothing is read. Filter by dateFrom and dateTo (YYYY-MM-DD) and amount. Each row is lean: id, date, amount, type, notes, status, chargeToType, chargeToId, company, billableOption, expenseReportId and memberId. Read-only.",
+    "Search expense entries (GET /expense/entries). With no member filter it returns the owner's own claims: the member is the owner's member id from the CW_MANAGE_MEMBER_ID environment variable, and with the variable unset nothing is read. With memberId or memberIdentifier it returns that member's claims, so an approver can review them (D23, revised 17/11/2026); ConnectWise member security decides what the caller's keys can see, and a 403 is returned as it came. Filter by dateFrom and dateTo (YYYY-MM-DD) and amount. Each row is lean: id, date, amount, type, notes, status, chargeToType, chargeToId, company, billableOption, expenseReportId and memberId. Read-only.",
     {
       memberId: z
         .number()
         .int()
         .positive()
         .optional()
-        .describe("Must be the owner's own member ID, or omitted. Any other member is refused"),
+        .describe("Only this member's claims, by member ID. Omit it, with memberIdentifier, for your own claims"),
+      memberIdentifier: z
+        .string()
+        .trim()
+        .regex(/^[A-Za-z0-9._-]+$/, "Letters, digits, dot, dash and underscore only")
+        .optional()
+        .describe("Only this member's claims, by member identifier, for example esmith"),
       dateFrom: z.string().regex(DATE_PATTERN).optional().describe("First date, YYYY-MM-DD"),
       dateTo: z.string().regex(DATE_PATTERN).optional().describe("Last date, YYYY-MM-DD"),
       amount: z.number().nonnegative().optional().describe("Exact amount"),
@@ -212,16 +221,20 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
       pageSize: z.number().int().positive().max(1000).optional().describe("Results per page (default: 25)"),
     },
     READ_ONLY,
-    async ({ memberId, dateFrom, dateTo, amount, page, pageSize }) => {
-      const member = ownMemberId();
-      if ("message" in member) return refused(member.message);
-      const own = member.id;
-      if (memberId !== undefined && memberId !== own) {
-        return refused(
-          `Expense claims are limited to the owner's own (D23). Member ${memberId} is not the member in ${MEMBER_ID_VARIABLE}. Nothing was read.`,
-        );
+    async ({ memberId, memberIdentifier, dateFrom, dateTo, amount, page, pageSize }) => {
+      // D23, revised 17/11/2026: a member filter reads that member's claims. No filter is the owner's own.
+      const parts: string[] = [];
+      let shownMember: number | null;
+      if (memberId === undefined && memberIdentifier === undefined) {
+        const member = ownMemberId();
+        if ("message" in member) return refused(member.message);
+        parts.push(`member/id = ${member.id}`);
+        shownMember = member.id;
+      } else {
+        if (memberId !== undefined) parts.push(`member/id = ${memberId}`);
+        if (memberIdentifier !== undefined) parts.push(`member/identifier = '${memberIdentifier}'`);
+        shownMember = memberId ?? null;
       }
-      const parts = [`member/id = ${own}`];
       if (dateFrom) parts.push(`date >= [${dateFrom}T00:00:00Z]`);
       if (dateTo) parts.push(`date < [${addDays(dateTo, 1)}T00:00:00Z]`);
       if (amount !== undefined) parts.push(`amount = ${amount}`);
@@ -233,7 +246,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
         orderBy: "date desc",
       });
       const rows = (Array.isArray(entries) ? entries : []).map(leanExpense);
-      return { content: [text({ memberId: own, count: rows.length, entries: rows })] };
+      return { content: [text({ memberId: shownMember, count: rows.length, entries: rows })] };
     },
   );
 
