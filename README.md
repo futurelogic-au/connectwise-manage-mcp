@@ -157,6 +157,15 @@ A time sheet is one member's time for one Saturday to Friday period (`/time/shee
 
 To add time to an approved sheet: reverse it, create the entry, submit it and approve it. ConnectWise takes new time only on a sheet that is Open.
 
+### Expense Reports
+An expense report is one member's group of expense entries sent for approval (`/expense/reports`). Unlike the claim tools above, the report tools read and decide **any member's** report, so the approver can review claims. Every write needs `confirm: true`, checks the status first and reads the report and its entries back. Tier one only: no tool takes an approval type. There is no delete tool and no tool that edits a report or an entry (PATCH and PUT on a report answer 405, and there is no entry reject in ConnectWise).
+- `cw_search_expense_reports`: Search reports, lean. Filter by member, status or the date the period starts
+- `cw_get_expense_report`: One report with its entries and a count of the entries by status
+- `cw_approve_expense_report`: Approve a `PendingApproval` or `ErrorsCorrected` report at tier one. A good approval reads `ApprovedByTierOne`
+- `cw_reject_expense_report`: Reject a `PendingApproval` or `ErrorsCorrected` report so the engineer gets the rejection notice. Needs a `reason`, sent to ConnectWise as the reject comment. The result reads the report and every entry back, with entry counts by status before and after. A good reject reads `Rejected`. Whether the reason shows in the engineer's notice is checked on the first live reject
+- `cw_submit_expense_report`: Submit an `Open` or `Rejected` report, for example to restore a report to `PendingApproval`
+- `cw_reverse_expense_report`: Reverse a tier one approval. Needs a `reason`. Only an `ApprovedByTierOne` report is reversed: any other status is refused before ConnectWise is called, because a reverse moved a `PendingApproval` report back to `Open` on our instance
+
 ### Schedule Entries
 - `cw_search_schedule_entries` — Search booked resource time
 - `cw_list_schedule_types` — List schedule types (Service, Project, Sales, Meeting)
