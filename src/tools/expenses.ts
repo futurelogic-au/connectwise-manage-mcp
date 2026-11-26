@@ -413,7 +413,7 @@ export function registerExpenseTools(server: McpServer, client: CwManageClient) 
       const root = typeof process !== "undefined" ? process.env.CW_MANAGE_ATTACH_ROOT : undefined;
       if (!root) {
         return refused(
-          "Receipts can be attached only from a folder named in the CW_MANAGE_ATTACH_ROOT environment variable, and it is not set. Nothing was read.",
+          "Attachments need the local ConnectWise MCP. Receipts are read only from a folder named in the CW_MANAGE_ATTACH_ROOT environment variable, and it is not set here. Nothing was read.",
         );
       }
 

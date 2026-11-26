@@ -7,8 +7,12 @@
  * - `worker.ts` — Cloudflare Workers (Web Standard) transport
  *
  * Credentials are resolved per request, in order:
- * 1. An explicit `CwManageConfig` override (gateway mode / Workers headers).
+ * 1. An explicit `CwManageConfig` override (gateway mode / Workers headers /
+ *    entra-keys mode).
  * 2. `getConfig()` reading from `process.env` (env mode).
+ *
+ * entra-keys mode never reaches step 2: a caller with no keys gets
+ * `createRefusingMcpServer()`, which holds no credentials at all.
  *
  * `tools/list` and `initialize` work without credentials; when no config is
  * available, only a single diagnostic `cw_test_connection` tool is registered,
@@ -16,6 +20,7 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { getConfig, CwManageClient, type CwManageConfig } from "./api-client.js";
 import { registerCardResources } from "./resources.js";
 import { registerTicketTools } from "./tools/tickets.js";
@@ -113,23 +118,7 @@ export function resolveGatewayConfig(
  *   When provided, the client is built from it instead of reading process.env.
  */
 export function createMcpServer(configOverride?: CwManageConfig): McpServer {
-  const server = new McpServer(
-    {
-      name: "connectwise-manage-mcp",
-      version: "1.4.0",
-    },
-    {
-      capabilities: {
-        extensions: {
-          "io.modelcontextprotocol/ui": {},
-        },
-      },
-    }
-  );
-
-  // MCP Apps (SEP-1865): the ui:// ticket card is static embedded HTML, so it
-  // is served with or without credentials (hosts may prefetch it).
-  registerCardResources(server);
+  const server = newServer();
 
   const config = configOverride ?? getConfig();
 
@@ -168,8 +157,63 @@ export function createMcpServer(configOverride?: CwManageConfig): McpServer {
     return server;
   }
 
-  const client = new CwManageClient(config);
+  registerAllTools(server, new CwManageClient(config));
 
+  return server;
+}
+
+/**
+ * A server that lists every tool and answers every tool call with `message` as
+ * a tool error. It holds no credentials and makes no ConnectWise request.
+ *
+ * Used in entra-keys mode so a signed-in person with no keys can still connect,
+ * and is told why a tool did not run.
+ */
+export function createRefusingMcpServer(message: string): McpServer {
+  const server = newServer();
+  registerAllTools(server, new RefusingClient(message));
+  // Replaces the SDK's own tool dispatch, so no tool handler runs.
+  server.server.setRequestHandler(CallToolRequestSchema, async () => ({
+    content: [{ type: "text" as const, text: message }],
+    isError: true,
+  }));
+  return server;
+}
+
+/** The backstop for the refusing server: any request it is asked to make throws. */
+class RefusingClient extends CwManageClient {
+  constructor(private readonly refusal: string) {
+    super({ baseUrl: "", companyId: "", publicKey: "", privateKey: "", clientId: "" });
+  }
+
+  override async request<T = unknown>(): Promise<T> {
+    throw new Error(this.refusal);
+  }
+}
+
+function newServer(): McpServer {
+  const server = new McpServer(
+    {
+      name: "connectwise-manage-mcp",
+      version: "1.4.0",
+    },
+    {
+      capabilities: {
+        extensions: {
+          "io.modelcontextprotocol/ui": {},
+        },
+      },
+    }
+  );
+
+  // MCP Apps (SEP-1865): the ui:// ticket card is static embedded HTML, so it
+  // is served with or without credentials (hosts may prefetch it).
+  registerCardResources(server);
+
+  return server;
+}
+
+function registerAllTools(server: McpServer, client: CwManageClient): void {
   registerTicketTools(server, client);
   registerCompanyTools(server, client);
   registerContactTools(server, client);
@@ -196,6 +240,4 @@ export function createMcpServer(configOverride?: CwManageConfig): McpServer {
   registerSetupWriteTools(server, client);
   registerTemplateTools(server, client);
   registerTimeSheetTools(server, client);
-
-  return server;
 }
