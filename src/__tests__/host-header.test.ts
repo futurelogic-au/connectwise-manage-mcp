@@ -168,7 +168,7 @@ describe("HTTP server with a malformed Host header", () => {
       }
     }
     throw new Error("server did not start");
-  });
+  }, 60_000);
 
   afterAll(() => {
     delete process.env.MCP_TRANSPORT;

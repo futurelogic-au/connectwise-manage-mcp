@@ -1,5 +1,12 @@
 ## [Unreleased]
 
+### Hosted mode
+
+- **`AUTH_MODE=entra-keys`: per-person ConnectWise keys from Azure Key Vault (CW 906783).** Each caller signs in with Entra ID, and every ConnectWise call uses the key pair held for their object id (`cw-<oid>-public`, `cw-<oid>-private`), read through a managed identity. Found pairs are cached for 15 minutes and misses for 1 minute. An optional `cw-<oid>-member-id` secret is read with the pair and put on the request config; no tool reads it yet. A signed-in person with no keys can connect and list tools, and every tool call answers with a plain refusal and makes no ConnectWise request. A vault that cannot be read is reported with a reference id, never as "no keys". The server never falls back to keys from the environment, ignores `MCP_BEARER_TOKEN` and `X-CW-*` headers in this mode, and does not start unless it runs over HTTP with `MCP_OAUTH_ENABLED=true` and its settings are complete. No key value or token is logged. Adds `@azure/identity` and `@azure/keyvault-secrets`, loaded only in this mode; both ask for Node 22 or later. Adds `npm run check` (typecheck, lint, tests).
+- A `401` for an invalid or expired token now carries `WWW-Authenticate` with `error="invalid_token"` and the protected-resource document, so a client knows to sign in again.
+- `cw_attach_document` with no `CW_MANAGE_ATTACH_ROOT` now starts its refusal with "Attachments need the local ConnectWise MCP".
+- A failure at startup now exits with code 1.
+
 ### Security
 
 - **Upstream error bodies no longer reach the caller or the log (#104).** A failed ConnectWise response is now reported as `ConnectWise API {METHOD} {path} returned {status} (reference {id})`. The response body is not included, not kept on the error, and not logged. Each failure writes one log line with the method, path, status and the same reference. A 400 stays actionable: `code`, `message` and the per-field `errors` (`code`, `message`, `resource`, `field`) are copied through an allowlist with size limits. A 403 keeps `code` and `message` only, through the same allowlist, so the missing permission is still named. Each copied string is cleaned and capped at 200 characters. **Behaviour change:** Manage's message text for 401, 404 and 409 is no longer returned, and `CwApiError` no longer has a `body` property. Token exchange logging now records the status and the OAuth error code, never the raw Azure response.

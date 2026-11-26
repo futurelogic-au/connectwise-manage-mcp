@@ -43,6 +43,11 @@ export interface CwManageConfig {
   clientId: string;
   /** Set when baseUrl came from the X-CW-Url header; checked before every request. */
   untrustedBaseUrl?: boolean;
+  /**
+   * The key owner's ConnectWise member id, set in entra-keys mode from that
+   * person's vault secret when there is one. No tool reads it yet.
+   */
+  memberId?: number;
 }
 
 export function getConfig(): CwManageConfig | null {

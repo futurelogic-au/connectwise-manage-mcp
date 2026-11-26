@@ -22,6 +22,8 @@ Two image paths are documented. Choose the one that fits your situation:
 
 Both paths converge at Phase 7. Only the image reference differs.
 
+> **This fork (`futurelogic-au`) always uses Path A.** Its image is built from this repository and pushed to ACR, tagged with the git commit SHA. It is never pulled from upstream. For the Future Logic deployment, follow [Per-person keys: `entra-keys` mode](#per-person-keys-entra-keys-mode-the-future-logic-deployment).
+
 ### What This Guide Does NOT Cover
 
 - **STDIO / Claude Desktop** — Claude Desktop uses the `stdio` transport and does not need a hosted server. See `README.md` for Claude Desktop setup.
@@ -389,7 +391,7 @@ Use this path if you are deploying the unmodified upstream image. No Docker buil
 $IMAGE_REF = "ghcr.io/wyre-ai/connectwise-manage-mcp:latest"
 ```
 
-> **Note:** If your fork's changes are merged upstream, you can switch from Path A to Path B and decommission ACR entirely.
+> **Note:** Path B runs the upstream image, which holds none of this fork's changes. Do not use it for this fork.
 
 ---
 
@@ -853,6 +855,106 @@ az keyvault secret show --vault-name $KEYVAULT_NAME --name "CW-COMPANY-ID"  --qu
 ```
 
 Also confirm the API member exists and is active in CWM under **Members → API Members**, and that the Client ID matches what is registered at `developer.connectwise.com`.
+
+---
+
+## Per-person keys: `entra-keys` mode (the Future Logic deployment)
+
+In `AUTH_MODE=entra-keys` each person signs in with Entra ID and every ConnectWise call uses that person's own API member keys. ConnectWise then records the right member against each change.
+
+### What the mode does
+
+| Request | Result |
+|---|---|
+| No token, a wrong audience, a wrong tenant or an expired token | `401`, with a `WWW-Authenticate` header that names the protected-resource document |
+| A token with no `CWM.Access` role | `403` |
+| The static `MCP_BEARER_TOKEN` | `401`. The variable is ignored in this mode, even when it is set |
+| A valid token, keys on file | The tool runs with that person's keys |
+| A valid token, no keys on file | The tools are listed. Each tool call returns "No ConnectWise API keys are on file for <upn>. Ask Stephan to add your key pair to the hosted ConnectWise MCP." No ConnectWise request is made |
+| A valid token, Key Vault cannot be read | Each tool call returns an error with a reference id. No ConnectWise request is made |
+
+The server never uses `CW_MANAGE_PUBLIC_KEY` or `CW_MANAGE_PRIVATE_KEY` in this mode, and ignores `X-CW-*` request headers.
+
+The server does not start unless `MCP_TRANSPORT=http`, `MCP_OAUTH_ENABLED=true` and every required variable below is set.
+
+### Resource names
+
+| Resource | Name |
+|---|---|
+| Resource group (Australia East) | `rg-fl-mcp-hosted` |
+| Log Analytics workspace | `law-fl-mcp` |
+| Container Apps environment (Consumption, shared by hosted vendor MCPs) | `aca-fl-mcp` |
+| Container Registry (Basic, admin user off) | `acrflmcp` |
+| Key Vault (RBAC, soft delete, purge protection) | `kv-fl-mcp` |
+| User-assigned managed identity (`AcrPull`, `Key Vault Secrets User`) | `id-fl-mcp-hosted` |
+| Container App (port 8080, 1 to 2 replicas, 0.5 vCPU, 1 GiB, probe `/health`) | `cw-mcp` |
+| Entra app registration (single tenant, assignment required) | `FL-MCP-ConnectWise` |
+
+### Image
+
+Build this fork and push it to `acrflmcp`. Tag the image with the git commit SHA. Never use `latest`, and never pull the upstream image: it does not hold this mode.
+
+```powershell
+$SHA = git rev-parse HEAD
+az acr login --name acrflmcp
+docker build --build-arg COMMIT_SHA=$SHA -t "acrflmcp.azurecr.io/connectwise-manage-mcp:$SHA" .
+docker push "acrflmcp.azurecr.io/connectwise-manage-mcp:$SHA"
+```
+
+### Key Vault secrets
+
+| Secret | Holds | Container variable |
+|---|---|---|
+| `cw-company-id` | ConnectWise company id | `CW_MANAGE_COMPANY_ID` |
+| `cw-url` | ConnectWise URL | `CW_MANAGE_URL` |
+| `cw-client-id` | ConnectWise developer client id | `CW_MANAGE_CLIENT_ID` |
+| `entra-tenant-id` | Entra tenant id | `AZURE_TENANT_ID` |
+| `entra-client-id` | App registration client id | `AZURE_CLIENT_ID` |
+| `entra-audience` | `api://<client-id>` | `AZURE_AUDIENCE` |
+| `mcp-server-url` | `https://<app fqdn>` | `MCP_SERVER_URL` |
+| `cw-<oid>-public`, `cw-<oid>-private` | One person's API member key pair | None. The app reads them at run time |
+| `cw-<oid>-member-id` | Optional. That person's ConnectWise member id | None. The app reads it at run time |
+
+`<oid>` is the person's Entra object id, in lower case.
+
+Plain variables: `MCP_TRANSPORT=http`, `MCP_HTTP_PORT=8080`, `MCP_HTTP_HOST=0.0.0.0`, `MCP_OAUTH_ENABLED=true`, `AUTH_MODE=entra-keys`, `AZURE_REQUIRED_ROLE=CWM.Access`, `KEY_VAULT_URI=https://kv-fl-mcp.vault.azure.net/`, `AZURE_CLIENT_ID_MI=<client id of id-fl-mcp-hosted>`, `NODE_ENV=production`, `LOG_LEVEL=info`.
+
+Do not set `MCP_BEARER_TOKEN`, `CW_MANAGE_MEMBER_ID` or `CW_MANAGE_ATTACH_ROOT`. A member id or a receipt folder set on the container would apply to every person.
+
+Enter secret values from a secure prompt or in the portal, so no value reaches shell history:
+
+```powershell
+$value = Read-Host -Prompt "Value" -AsSecureString
+az keyvault secret set --vault-name kv-fl-mcp --name "<secret name>" --value (ConvertFrom-SecureString $value -AsPlainText) --output none
+```
+
+### Server URL on the first deploy
+
+With OAuth on, the server needs `MCP_SERVER_URL` to start. The app's FQDN is `<app name>.<environment default domain>`, so read the domain first and store `mcp-server-url` before you create the app:
+
+```powershell
+$domain = az containerapp env show --name aca-fl-mcp --resource-group rg-fl-mcp-hosted --query properties.defaultDomain --output tsv
+"https://cw-mcp.$domain"
+```
+
+### Add a person
+
+1. Assign the `CWM.Access` role to the person.
+2. Store their key pair as `cw-<oid>-public` and `cw-<oid>-private`.
+3. Ask them to add the connector at `https://<app fqdn>/mcp`.
+
+The server reads a new pair within 1 minute. It needs no restart.
+
+### Revoke a person
+
+1. Revoke their API key pair in ConnectWise. This takes effect at once.
+2. Disable or delete both secrets. The server drops a cached pair within 15 minutes.
+3. Remove the `CWM.Access` assignment.
+
+### Limits
+
+- `cw_attach_document` needs a local folder, so it answers "Attachments need the local ConnectWise MCP".
+- The tools that act on your own expense claims need `CW_MANAGE_MEMBER_ID`, so they refuse in this mode.
 
 ---
 

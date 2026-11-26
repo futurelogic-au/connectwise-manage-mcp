@@ -344,7 +344,7 @@ For a self-hosted instance:
 ```
 
 - **It is per person.** Each person sets it in their own connector entry, on their own machine, to their own folder. It is never shared, and it is never read from a request.
-- **Unset, the tool refuses.** With no `CW_MANAGE_ATTACH_ROOT` the attach says so and reads nothing, so a receipt is never attached by accident.
+- **Unset, the tool refuses.** With no `CW_MANAGE_ATTACH_ROOT` the attach answers that attachments need the local ConnectWise MCP, names the variable and reads nothing, so a receipt is never attached by accident.
 - **Only that folder is read.** A file outside it, including one reached through a link, is refused. The file is read and never moved, renamed or changed.
 - Restart the client after you set it. The connector reads its environment when it starts.
 

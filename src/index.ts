@@ -19,7 +19,8 @@
  *   MCP_TRANSPORT               - "stdio" (default) or "http"
  *   MCP_HTTP_PORT               - HTTP port (default: 8080)
  *   MCP_HTTP_HOST               - HTTP host (default: 0.0.0.0)
- *   AUTH_MODE                   - "env" (default) or "gateway" for header-based auth
+ *   AUTH_MODE                   - "env" (default), "gateway" for header-based auth,
+ *                                  or "entra-keys" for per-person keys from Key Vault
  *
  * Entra ID OAuth 2.1 (optional — set MCP_OAUTH_ENABLED=true to activate):
  *   MCP_OAUTH_ENABLED           - Enable Entra ID auth middleware (default: false)
@@ -29,6 +30,14 @@
  *   AZURE_AUDIENCE              - Token audience, typically api://<AZURE_CLIENT_ID>
  *   AZURE_REQUIRED_ROLE         - App role claim required on every request (default: CWM.Access)
  *   MCP_BEARER_TOKEN            - Static bearer token for Claude Code CLI / Claude Desktop
+ *                                  (ignored when AUTH_MODE=entra-keys)
+ *
+ * AUTH_MODE=entra-keys (needs MCP_TRANSPORT=http and MCP_OAUTH_ENABLED=true):
+ *   KEY_VAULT_URI               - Vault holding cw-<oid>-public, cw-<oid>-private and
+ *                                  the optional cw-<oid>-member-id
+ *   AZURE_CLIENT_ID_MI          - Client ID of the user-assigned managed identity
+ *   CW_MANAGE_URL, CW_MANAGE_COMPANY_ID, CW_MANAGE_CLIENT_ID - shared by every person.
+ *                                  CW_MANAGE_PUBLIC_KEY and _PRIVATE_KEY are not used.
  */
 
 import {
@@ -49,9 +58,23 @@ import {
   handleAuthorize,
   handleToken,
 } from "./auth/routes.js";
-import { AuthError } from "./auth/types.js";
+import { AuthError, type EntraIdentity } from "./auth/types.js";
+import {
+  ENTRA_KEYS_MODE,
+  readEntraKeysSettings,
+  noKeysMessage,
+  keyStoreFailureMessage,
+  type EntraKeysSettings,
+} from "./auth/entra-keys.js";
+import {
+  createKeyStore,
+  createKeyVaultReader,
+  KeyStoreError,
+  type KeyStore,
+} from "./auth/key-store.js";
 import {
   createMcpServer,
+  createRefusingMcpServer,
   resolveGatewayConfig,
   type CwManageConfig,
 } from "./mcp-server.js";
@@ -86,6 +109,16 @@ async function startHttpTransport(): Promise<void> {
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
   const authMode = process.env.AUTH_MODE || "env";
   const isGatewayMode = authMode === "gateway";
+  const isEntraKeysMode = authMode === ENTRA_KEYS_MODE;
+
+  // Throws, so the server does not start, when the mode is not fully set up.
+  const entraKeys = isEntraKeysMode ? readEntraKeysSettings(process.env) : null;
+  let keyStore: KeyStore | null = null;
+  if (entraKeys) {
+    keyStore = createKeyStore(
+      await createKeyVaultReader(entraKeys.keyVaultUri, entraKeys.managedIdentityClientId),
+    );
+  }
 
   // ---------------------------------------------------------------------------
   // Entra ID auth setup (optional)
@@ -96,6 +129,11 @@ async function startHttpTransport(): Promise<void> {
 
   if (oauthEnabled) {
     entraConfig = getEntraConfig();
+    // entra-keys: a static token names no person, so it cannot choose keys.
+    if (isEntraKeysMode && entraConfig.bearerToken) {
+      entraConfig = { ...entraConfig, bearerToken: undefined };
+      console.error("[auth] MCP_BEARER_TOKEN is set and ignored in entra-keys mode");
+    }
     jwksClient = createJwksClient(entraConfig);
     console.error(
       `[auth] Entra ID OAuth enabled — tenant: ${entraConfig.tenantId}, required role: ${entraConfig.requiredRole}`,
@@ -173,7 +211,7 @@ async function startHttpTransport(): Promise<void> {
         JSON.stringify({
           status: "ok",
           transport: "http",
-          authMode: isGatewayMode ? "gateway" : "env",
+          authMode: isEntraKeysMode ? ENTRA_KEYS_MODE : isGatewayMode ? "gateway" : "env",
           oauthEnabled,
           timestamp: new Date().toISOString(),
         }),
@@ -209,6 +247,7 @@ async function startHttpTransport(): Promise<void> {
       // Entra ID auth check
       // ------------------------------------------------------------------
       const handleMcp = async () => {
+        let identity: EntraIdentity | undefined;
         if (oauthEnabled && entraConfig) {
           const authHeader = req.headers.authorization;
 
@@ -229,7 +268,6 @@ async function startHttpTransport(): Promise<void> {
           const token = authHeader.slice(7);
 
           try {
-            let identity;
             // Static bearer token check (Claude Code CLI / Claude Desktop)
             // Use timing-safe comparison to prevent token length oracle attacks
             const staticTokenMatch =
@@ -252,7 +290,15 @@ async function startHttpTransport(): Promise<void> {
             );
           } catch (err) {
             if (err instanceof AuthError) {
-              res.writeHead(err.statusCode, { "Content-Type": "application/json" });
+              res.writeHead(err.statusCode, {
+                "Content-Type": "application/json",
+                // A 401 tells the client to sign in again or refresh its token.
+                ...(err.statusCode === 401
+                  ? {
+                      "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${entraConfig.serverUrl}/.well-known/oauth-protected-resource"`,
+                    }
+                  : {}),
+              });
               res.end(JSON.stringify({ error: "auth_failed", message: err.message }));
             } else {
               console.error("[auth] Unexpected validation error:", err);
@@ -295,7 +341,10 @@ async function startHttpTransport(): Promise<void> {
         // ------------------------------------------------------------------
         // MCP handler
         // ------------------------------------------------------------------
-        const server = createMcpServer(configOverride);
+        const server =
+          entraKeys && keyStore
+            ? await createPersonServer(entraKeys, keyStore, identity)
+            : createMcpServer(configOverride);
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
           enableJsonResponse: true,
@@ -341,11 +390,47 @@ async function startHttpTransport(): Promise<void> {
       );
       console.error(`Health check available at http://${host}:${port}/health`);
       console.error(
-        `Authentication mode: ${isGatewayMode ? "gateway (header-based)" : "env (environment variables)"}`,
+        `Authentication mode: ${
+          isEntraKeysMode
+            ? "entra-keys (each caller's own keys from Key Vault)"
+            : isGatewayMode
+              ? "gateway (header-based)"
+              : "env (environment variables)"
+        }`,
       );
       resolve();
     });
   });
+}
+
+/**
+ * The MCP server for one signed-in person in entra-keys mode: built on their
+ * own keys, or refusing every tool call when there are none or the vault cannot
+ * be read. It never falls back to keys from the environment.
+ */
+async function createPersonServer(
+  settings: EntraKeysSettings,
+  keyStore: KeyStore,
+  identity: EntraIdentity | undefined,
+) {
+  if (!identity) {
+    throw new Error("entra-keys mode reached the MCP handler with no validated identity");
+  }
+  try {
+    const keys = await keyStore.resolve(identity.oid, identity.upn);
+    if (!keys) return createRefusingMcpServer(noKeysMessage(identity.upn));
+    return createMcpServer({
+      baseUrl: settings.baseUrl,
+      companyId: settings.companyId,
+      clientId: settings.clientId,
+      ...keys,
+    });
+  } catch (err) {
+    if (err instanceof KeyStoreError) {
+      return createRefusingMcpServer(keyStoreFailureMessage(err.reference));
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,8 +464,13 @@ async function main(): Promise<void> {
   if (transportType === "http") {
     await startHttpTransport();
   } else {
+    // entra-keys is HTTP only: refuse rather than run on keys from the environment.
+    if (process.env.AUTH_MODE === ENTRA_KEYS_MODE) readEntraKeysSettings(process.env);
     await startStdioTransport();
   }
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
