@@ -63,7 +63,7 @@ Azure Container Apps (external ingress, port 8080)
 ## Prerequisites
 
 - **Azure CLI** installed and logged in (`az login`)
-- **Docker Desktop** running (Path A only)
+- **Docker Desktop**, only if your subscription blocks registry builds (Path A only)
 - **Entra ID app registration** completed — follow [`entra-app-registration.md`](entra-app-registration.md) before continuing. You need:
   - `AZURE_CLIENT_ID` (Application ID)
   - `AZURE_TENANT_ID` (Directory ID)
@@ -363,23 +363,28 @@ $KV_URI_LOG_LEVEL     = az keyvault secret show --vault-name $KEYVAULT_NAME --na
 
 ### Path A — Build and Push to ACR (fork / custom build)
 
-Use this path if you are deploying a fork with custom changes.
+Use this path if you are deploying a fork with custom changes. The image builds in the registry, so no local Docker is needed. Tag the image with the git commit SHA.
 
 ```powershell
-# Authenticate Docker to ACR using your Azure login (no admin password needed)
-az acr login --name $ACR_NAME
+# Run from the root of a clean checkout of the commit you want to deploy
+$SHA = git rev-parse HEAD
 
-# Build from the repo root
-docker build -t "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest" .
+# Upload the source, then build and store the image in ACR
+az acr build --registry $ACR_NAME --image "connectwise-manage-mcp:$SHA" --build-arg COMMIT_SHA=$SHA .
 
-# Push to ACR
-docker push "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest"
-
-# Verify the image is there
-az acr repository list --name $ACR_NAME --output table
+# Verify the tag is there
+az acr repository show-tags --name $ACR_NAME --repository connectwise-manage-mcp --output table
 
 # Set the image reference variable used in Phase 7
-$IMAGE_REF = "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest"
+$IMAGE_REF = "$ACR_LOGIN_SERVER/connectwise-manage-mcp:$SHA"
+```
+
+**Fallback: Docker Desktop.** Use this only if the subscription blocks registry builds. Run it in place of the `az acr build` command, with Docker Desktop running.
+
+```powershell
+az acr login --name $ACR_NAME
+docker build --build-arg COMMIT_SHA=$SHA -t "$ACR_LOGIN_SERVER/connectwise-manage-mcp:$SHA" .
+docker push "$ACR_LOGIN_SERVER/connectwise-manage-mcp:$SHA"
 ```
 
 ### Path B — Use Upstream GHCR Image (no ACR required)
@@ -694,15 +699,17 @@ az containerapp logs show `
 cd /path/to/connectwise-manage-mcp
 git pull
 
-az acr login --name $ACR_NAME
-docker build -t "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest" .
-docker push "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest"
+$SHA = git rev-parse HEAD
+az acr build --registry $ACR_NAME --image "connectwise-manage-mcp:$SHA" --build-arg COMMIT_SHA=$SHA .
 
+$IMAGE_REF = "$ACR_LOGIN_SERVER/connectwise-manage-mcp:$SHA"
 az containerapp update `
   --name $ACA_APP_NAME `
   --resource-group $RESOURCE_GROUP `
-  --image "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest"
+  --image $IMAGE_REF
 ```
+
+If the subscription blocks registry builds, use the Docker Desktop fallback in Phase 6.
 
 ### Update to a New Image Version (Path B)
 
@@ -892,10 +899,19 @@ The server does not start unless `MCP_TRANSPORT=http`, `MCP_OAUTH_ENABLED=true` 
 
 ### Image
 
-Build this fork and push it to `acrflmcp`. Tag the image with the git commit SHA. Never use `latest`, and never pull the upstream image: it does not hold this mode.
+Build this fork in the registry `acrflmcp`. Tag the image with the git commit SHA. Never use `latest`, and never pull the upstream image: it does not hold this mode.
+
+Run this from the root of a fresh clone of `main` at the commit you want to deploy:
 
 ```powershell
 $SHA = git rev-parse HEAD
+az acr build --registry acrflmcp --image "connectwise-manage-mcp:$SHA" --build-arg COMMIT_SHA=$SHA .
+az acr repository show-tags --name acrflmcp --repository connectwise-manage-mcp --output table
+```
+
+**Fallback: Docker Desktop.** Use this only if the subscription blocks registry builds. The tag stays the same.
+
+```powershell
 az acr login --name acrflmcp
 docker build --build-arg COMMIT_SHA=$SHA -t "acrflmcp.azurecr.io/connectwise-manage-mcp:$SHA" .
 docker push "acrflmcp.azurecr.io/connectwise-manage-mcp:$SHA"
