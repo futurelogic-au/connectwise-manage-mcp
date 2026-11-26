@@ -888,7 +888,7 @@ The server does not start unless `MCP_TRANSPORT=http`, `MCP_OAUTH_ENABLED=true` 
 
 | Resource | Name |
 |---|---|
-| Resource group (Australia East) | `rg-fl-mcp-hosted` |
+| Resource group (Australia East) | `rg-fl-mcp` |
 | Log Analytics workspace | `law-fl-mcp` |
 | Container Apps environment (Consumption, shared by hosted vendor MCPs) | `aca-fl-mcp` |
 | Container Registry (Basic, admin user off) | `acrflmcp` |
@@ -949,7 +949,7 @@ az keyvault secret set --vault-name kv-fl-mcp --name "<secret name>" --value (Co
 With OAuth on, the server needs `MCP_SERVER_URL` to start. The app's FQDN is `<app name>.<environment default domain>`, so read the domain first and store `mcp-server-url` before you create the app:
 
 ```powershell
-$domain = az containerapp env show --name aca-fl-mcp --resource-group rg-fl-mcp-hosted --query properties.defaultDomain --output tsv
+$domain = az containerapp env show --name aca-fl-mcp --resource-group rg-fl-mcp --query properties.defaultDomain --output tsv
 "https://cw-mcp.$domain"
 ```
 
